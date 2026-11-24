@@ -3,7 +3,7 @@ import asyncio
 from app.schemas.message import ToolCall
 from app.tools.registry import ToolRegistry
 from app.tools.validator import SchemaValidator
-from app.tools.toolcache import ToolCache
+from app.tools.toolcache import CacheBackend
 
 
 class ToolRunner:
@@ -11,7 +11,7 @@ class ToolRunner:
         self,
         registry: ToolRegistry,
         validator: SchemaValidator,
-        cache: ToolCache
+        cache: CacheBackend
     ):
         self.registry = registry
         self.validator = validator
@@ -22,20 +22,23 @@ class ToolRunner:
     def should_retry(error: Exception) -> bool:
         return isinstance(error, (TimeoutError, ConnectionError))
 
+
+
     async def execute(
-            self, 
-            tool_call: ToolCall,
-            allowed_tools: list[str]
-        ):
+        self,
+        tool_call: ToolCall,
+        allowed_tools: list[str]
+    ):
         if tool_call.tool_name not in allowed_tools:
             return {
                 "success": False,
-                "result" : None,
-                "error" : {
+                "result": None,
+                "error": {
                     "code": "TOOL_NOT_ALLOWED",
-                    "message":f"Tool not allowed: {tool_call.tool_name}"
+                    "message": f"Tool not allowed: {tool_call.tool_name}"
                 }
             }
+
         # 1. 查找工具
         try:
             tool = self.registry.get(tool_call.tool_name)
@@ -71,16 +74,21 @@ class ToolRunner:
         cache_key = None
 
         if tool.cacheable:
-            cache_key = self.cache.make_key(tool.name, args)
+            try:
+                cache_key = self.cache.make_key(tool.name, args)
 
-            cache_hit, cached_result = self.cache.get(cache_key)
+                cache_hit, cached_result = await self.cache.get(cache_key)
 
-            if cache_hit:
-                return {
-                    "success": True,
-                    "result": cached_result,
-                    "error": None
-                }
+                if cache_hit:
+                    return {
+                        "success": True,
+                        "result": cached_result,
+                        "error": None
+                    }
+
+            except Exception:
+                # 缓存不可用，跳过缓存，继续执行工具
+                cache_key = None
 
         # 4. 执行工具并进行有限重试
         last_error = None
@@ -92,23 +100,26 @@ class ToolRunner:
             except Exception as e:
                 last_error = e
 
-                # 不值得重试，直接结束循环
                 if not self.should_retry(e):
                     break
 
-                # 不是最后一次尝试，才等待
                 if attempt < tool.retry_policy.max_attempts - 1:
                     await asyncio.sleep(tool.retry_policy.retry_delay)
 
             else:
                 # 5. 只缓存成功结果
                 if tool.cacheable and cache_key is not None:
-                    self.cache.set(
-                        cache_key,
-                        result,
-                        tool.cache_ttl
-                    )
+                    try:
+                        await self.cache.set(
+                            cache_key,
+                            result,
+                            tool.cache_ttl
+                        )
+                    except Exception:
+                        # 缓存写入失败，不影响工具执行结果
+                        pass
 
+                # 注意：无论工具是否支持缓存，执行成功都要返回
                 return {
                     "success": True,
                     "result": result,

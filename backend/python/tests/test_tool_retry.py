@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import pytest
 
 from app.schemas.message import ToolCall
@@ -62,7 +62,7 @@ async def test_retry_then_success():
         return {"result": "success"}
 
     runner = create_runner(execute)
-    result = await runner.execute(create_tool_call())
+    result = await runner.execute(create_tool_call(), allowed_tools=["test_tool"])
 
     assert calls == 2
     assert result["success"] is True
@@ -79,7 +79,7 @@ async def test_all_attempts_failed():
         raise TimeoutError(f"timeout {calls}")
 
     runner = create_runner(execute)
-    result = await runner.execute(create_tool_call())
+    result = await runner.execute(create_tool_call(), allowed_tools=["test_tool"])
 
     assert calls == 3
     assert result["success"] is False
@@ -96,7 +96,7 @@ async def test_non_retryable_error():
         raise ValueError("invalid value")
 
     runner = create_runner(execute)
-    result = await runner.execute(create_tool_call())
+    result = await runner.execute(create_tool_call(), allowed_tools=["test_tool"])
 
     assert calls == 1
     assert result["success"] is False
@@ -114,8 +114,8 @@ async def test_cache_hit_after_success():
 
     runner = create_runner(execute)
 
-    first = await runner.execute(create_tool_call())
-    second = await runner.execute(create_tool_call())
+    first = await runner.execute(create_tool_call(), allowed_tools=["test_tool"])
+    second = await runner.execute(create_tool_call(), allowed_tools=["test_tool"])
 
     assert first["success"] is True
     assert second["success"] is True
@@ -132,7 +132,7 @@ async def test_single_attempt():
         raise TimeoutError("timeout")
 
     runner = create_runner(execute, max_attempts=1)
-    result = await runner.execute(create_tool_call())
+    result = await runner.execute(create_tool_call(), allowed_tools=["test_tool"])
 
     assert calls == 1
     assert result["success"] is False
@@ -150,6 +150,6 @@ async def test_cancellation_is_not_retried():
     runner = create_runner(execute)
 
     with pytest.raises(asyncio.CancelledError):
-        await runner.execute(create_tool_call())
+        await runner.execute(create_tool_call(), allowed_tools=["test_tool"])
 
     assert calls == 1

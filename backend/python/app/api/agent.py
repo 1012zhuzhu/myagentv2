@@ -1,20 +1,19 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 from app.schemas.agentconfig import (
     AgentExecuteRequest,
     AgentExecuteResponse,
 )
-from app.service.agent_service import AgentService
-from app.agent.runtime_impl import LangGraphRuntime
 
 router = APIRouter()
-
-runtime = LangGraphRuntime()
-agent_service = AgentService(runtime=runtime)
 
 
 @router.post("/internal/v1/agent/execute")
 async def execute(
-    request: AgentExecuteRequest
+    request: AgentExecuteRequest,
+    http_request: Request,
 ) -> AgentExecuteResponse:
+
+    agent_service = http_request.app.state.agent_service
+
     return await agent_service.execute(request)

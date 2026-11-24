@@ -12,6 +12,7 @@ from app.schemas.message import (
 )
 from app.schemas.tooldefinition import ToolDefinition
 from app.tools.setup import create_tool_registry
+from app.tools.toolcache import ToolCache
 from app.tools.toolrunner import ToolRunner
 from app.tools.validator import SchemaValidator
 
@@ -35,7 +36,8 @@ async def test_agent_graph_tool_call_loop():
     # 3. 初始化 ToolRunner
     runner = ToolRunner(
         registry=registry,
-        validator=SchemaValidator()
+        validator=SchemaValidator(),
+        cache=ToolCache()
     )
 
     # 4. 初始化两个节点

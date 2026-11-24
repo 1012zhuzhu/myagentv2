@@ -18,9 +18,9 @@ import { useCanvasStore } from "./store/useStore";
 type WorkflowApiResponse =
   | {
       success: true;
-      result: {
-        output: unknown;
-      };
+      run_id: string;
+      conversation_id: string;
+      status: string;
     }
   | {
       success: false;
@@ -30,13 +30,13 @@ type WorkflowApiResponse =
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ?? "http://localhost:3000";
 
-function formatOutput(output: unknown): string {
-  if (typeof output === "string") {
-    return output;
-  }
+// function formatOutput(output: unknown): string {
+//   if (typeof output === "string") {
+//     return output;
+//   }
 
-  return JSON.stringify(output, null, 2) ?? String(output);
-}
+//   return JSON.stringify(output, null, 2) ?? String(output);
+// }
 
 function App() {
   const { isDarkMode, saveFlow } = useCanvasStore();
@@ -67,17 +67,41 @@ function App() {
         }),
       });
 
+
       const data = (await response.json()) as WorkflowApiResponse;
 
-      if (!response.ok || !data.success) {
+      if (!response.ok) {
         throw new Error(
-          data.success ? "Workflow execution failed" : data.message,
+          "message" in data ? data.message : "Workflow submission failed",
         );
       }
 
-      const output = formatOutput(data.result.output);
-      setRunMessage({ type: "success", content: output });
-      console.log("Workflow Result:", data.result.output);
+      if (!data.success) {
+        throw new Error(data.message);
+      }
+
+      if (!data.run_id) {
+        throw new Error("Go 后端响应缺少 run_id");
+      }
+
+      setRunMessage({
+        type: "success",
+        content: `工作流提交成功！\nRun ID: ${data.run_id}\n当前状态: ${data.status}`,
+      });
+
+      console.log("Workflow Submitted:", data);
+
+      // const data = (await response.json()) as WorkflowApiResponse;
+
+      // if (!response.ok || !data.success) {
+      //   throw new Error(
+      //     data.success ? "Workflow execution failed" : data.message,
+      //   );
+      // }
+
+      // const output = formatOutput(data.result.output);
+      // setRunMessage({ type: "success", content: output });
+      // console.log("Workflow Result:", data.result.output);
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Workflow execution failed";

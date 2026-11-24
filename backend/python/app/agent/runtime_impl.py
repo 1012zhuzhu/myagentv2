@@ -4,7 +4,7 @@ from app.agent.graph import AgentGraph
 from app.agent.nodes.model_node import ModelNode
 from app.agent.nodes.tool_node import ToolNode
 
-from app.model.mock_model import MockModel
+from app.model.deepseek_model import DeepSeekModel
 
 from app.schemas.message import UserMessage
 from app.schemas.tooldefinition import ToolDefinition
@@ -13,9 +13,9 @@ from app.tools.setup import create_tool_system
 
 
 class LangGraphRuntime:
-    def __init__(self):
+    def __init__(self, redis_client):
         # 1. 初始化工具系统
-        self.registry, self.runner = create_tool_system()
+        self.registry, self.runner = create_tool_system(redis_client)
 
         # 2. 将内部 Tool 转换为模型可见的 ToolDefinition
         self.tools = [
@@ -51,7 +51,7 @@ class LangGraphRuntime:
 
         # 4. 为本次请求创建节点
         model_node = ModelNode(
-            model=MockModel(),
+            model=DeepSeekModel(),
             tools=available_tools
         )
 

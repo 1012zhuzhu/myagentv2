@@ -18,7 +18,7 @@ class ToolResponse(BaseModel):
 ModelResponse = Union[TextResponse, ToolResponse]
 
 class Model(Protocol):
-    def invoke(
+    async def invoke(
         self,
         messages: list[Message],
         tools: list[ToolDefinition]

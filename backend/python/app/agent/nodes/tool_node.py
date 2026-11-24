@@ -66,10 +66,10 @@ class ToolNode:
 
         return {"messages": tool_messages}
 
-    async def run_tool(self, too_call):
+    async def run_tool(self, tool_call):
         async with self.semaphore:
             return await self.runner.execute(
-                too_call,
+                tool_call,
                 self.allowed_tools
                 )
 

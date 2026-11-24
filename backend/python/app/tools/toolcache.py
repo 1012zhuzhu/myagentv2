@@ -2,8 +2,27 @@ from copy import deepcopy
 import hashlib
 import json
 import time
-from typing import Any, OrderedDict
+from collections import OrderedDict
+from typing import Any, Protocol
 
+class CacheBackend(Protocol):
+    @staticmethod
+    def make_key(
+        tool_name: str,
+        args: dict[str, Any]
+    ) -> str:
+        ...
+
+    async def get(self, key: str) -> tuple[bool, Any]:
+        ...
+
+    async def set(
+        self,
+        key: str,
+        value: Any,
+        ttl: int
+    ) -> None:
+        ...
 
 class ToolCache:
     def __init__(self, max_entries: int = 1000):
@@ -28,7 +47,7 @@ class ToolCache:
 
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-    def get(self, key: str) -> tuple[bool, Any]:
+    async def get(self, key: str) -> tuple[bool, Any]:
         entry = self._data.get(key)
 
         if entry is None:
@@ -44,7 +63,7 @@ class ToolCache:
 
         return True, deepcopy(value)
 
-    def set(self, key: str, value: Any, ttl: int) -> None:
+    async def set(self, key: str, value: Any, ttl: int) -> None:
         if ttl <= 0:
             return
 
@@ -81,3 +100,6 @@ class ToolCache:
             del self._data[key]
 
         return len(expired_keys)
+
+    def clear(self) -> None:
+        self._data.clear()
