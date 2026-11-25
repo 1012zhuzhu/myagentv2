@@ -26,10 +26,17 @@ func NewPublisher(
 }
 
 func (p *Publisher) PublishPending(ctx context.Context) error {
-	outboxs,err:= p.outboxRepo.GetPendingOutboxes()
+	outboxs, err := p.outboxRepo.GetPendingOutboxes()
 	if err != nil {
+		log.Printf("get pending outboxes failed: %v", err)
 		return err
 	}
+
+	if len(outboxs) == 0 {
+		return nil
+	}
+
+	log.Printf("pending outboxes loaded count=%d", len(outboxs))
 
 	for _,outbox :=  range outboxs {
 		err := p.publishOne(ctx,outbox)
@@ -42,26 +49,50 @@ func (p *Publisher) PublishPending(ctx context.Context) error {
 }
 
 func (p *Publisher) publishOne(
-	ctx context.Context,
-	outbox domain.Outbox,
+    ctx context.Context,
+    outbox domain.Outbox,
 ) error {
-	body,err := json.Marshal(outbox)
-	if err != nil {
-		return err
-	}
+    logger := log.New(
+        log.Writer(),
+        fmt.Sprintf(
+            "[event_id=%s run_id=%s event_type=%s] ",
+            outbox.EventID,
+            outbox.RunID,
+            outbox.EventType,
+        ),
+        log.LstdFlags,
+    )
 
-	err = p.rabbitMQ.PublishWithConfirm(ctx,body)
-	if err != nil {
-		return err
-	}
+    body, err := json.Marshal(outbox)
+    if err != nil {
+        logger.Printf("marshal outbox failed: %v", err)
+        return err
+    }
 
-	publishedAt := time.Now()
+    logger.Println("publishing outbox")
 
-	err = p.outboxRepo.MarkPublished(outbox.EventID,publishedAt)
-	if err != nil {
-		return fmt.Errorf("mark outbox published failed: %w", err)
-	}
-	return nil
+    err = p.rabbitMQ.PublishWithConfirm(ctx, body)
+    if err != nil {
+        logger.Printf("rabbitmq publish failed: %v", err)
+        return err
+    }
+
+    logger.Println("rabbitmq publish confirmed")
+
+    publishedAt := time.Now()
+
+    err = p.outboxRepo.MarkPublished(
+        outbox.EventID,
+        publishedAt,
+    )
+    if err != nil {
+        logger.Printf("mark outbox published failed: %v", err)
+        return fmt.Errorf("mark outbox published failed: %w", err)
+    }
+
+    logger.Println("outbox marked as published")
+
+    return nil
 }
 
 func(p *Publisher) Run(ctx context.Context, interval time.Duration) {

@@ -32,6 +32,15 @@ func NewConsumer(
 	}
 }
 
+// logWithRunID 统一 Consumer 日志格式
+func logWithRunID(runID string, format string, args ...interface{}) {
+	log.Printf(
+		"[run_id=%s] %s",
+		runID,
+		fmt.Sprintf(format, args...),
+	)
+}
+
 func (c *Consumer) Run(ctx context.Context) error {
 	deliveries, err := c.channel.Consume(
 		"workflow.run",
@@ -46,9 +55,12 @@ func (c *Consumer) Run(ctx context.Context) error {
 		return fmt.Errorf("start consuming message: %w", err)
 	}
 
+	log.Println("consumer started, waiting for workflow messages")
+
 	for {
 		select {
 		case <-ctx.Done():
+			log.Println("consumer stopped")
 			return nil
 
 		case delivery, ok := <-deliveries:
@@ -82,6 +94,15 @@ func (c *Consumer) handleDelivery(
 
 		return fmt.Errorf("unmarshal outbox failed: %w", err)
 	}
+
+	runID := outbox.RunID
+
+	logWithRunID(
+		runID,
+		"received workflow message event_id=%s event_type=%s",
+		outbox.EventID,
+		outbox.EventType,
+	)
 
 	// 2. 校验事件类型
 	if outbox.EventType != "workflow.run" {
@@ -139,7 +160,9 @@ func (c *Consumer) handleDelivery(
 	}
 
 	// 5. 原子领取 Run
-	claimed, err := c.runRepo.ClaimPendingRun(outbox.RunID)
+	logWithRunID(runID, "attempting to claim run")
+
+	claimed, err := c.runRepo.ClaimPendingRun(runID)
 	if err != nil {
 		if nackErr := delivery.Nack(false, true); nackErr != nil {
 			return fmt.Errorf(
@@ -158,15 +181,19 @@ func (c *Consumer) handleDelivery(
 			return fmt.Errorf("ack duplicate message failed: %w", err)
 		}
 
-		log.Printf(
-			"run %s already claimed or processed, skip execution",
-			outbox.RunID,
+		logWithRunID(
+			runID,
+			"already claimed or processed, skip execution",
 		)
 
 		return nil
 	}
 
+	logWithRunID(runID, "run claimed successfully")
+
 	// 7. 调用 Workflow Engine
+	logWithRunID(runID, "workflow execution started")
+
 	result, executeErr := c.engine.Execute(
 		ctx,
 		payload.Workflow,
@@ -177,9 +204,15 @@ func (c *Consumer) handleDelivery(
 	// 8. 工作流执行失败
 	if executeErr != nil {
 
+		logWithRunID(
+			runID,
+			"workflow execution failed: %v",
+			executeErr,
+		)
+
 		// 8.1 持久化失败状态和错误信息
 		if err := c.runRepo.MarkRunFailed(
-			outbox.RunID,
+			runID,
 			executeErr.Error(),
 		); err != nil {
 
@@ -199,6 +232,8 @@ func (c *Consumer) handleDelivery(
 			)
 		}
 
+		logWithRunID(runID, "failure status and error saved to database")
+
 		// 8.2 失败状态已经保存，确认 RabbitMQ 消息
 		if err := delivery.Ack(false); err != nil {
 			return fmt.Errorf(
@@ -208,21 +243,16 @@ func (c *Consumer) handleDelivery(
 		}
 
 		// 8.3 业务失败不是消息消费失败
-		log.Printf(
-			"workflow run %s failed: %v",
-			outbox.RunID,
-			executeErr,
+		logWithRunID(
+			runID,
+			"failed workflow message acknowledged",
 		)
 
 		return nil
 	}
 
 	// 9. 工作流执行成功
-	log.Printf(
-		"workflow run %s result: %+v",
-		outbox.RunID,
-		result,
-	)
+	logWithRunID(runID, "workflow execution produced a result")
 
 	// 9.1 序列化执行结果
 	resultBytes, err := json.Marshal(result)
@@ -240,7 +270,7 @@ func (c *Consumer) handleDelivery(
 
 	// 9.2 保存执行结果
 	if err := c.runRepo.SaveResult(
-		outbox.RunID,
+		runID,
 		string(resultBytes),
 	); err != nil {
 
@@ -255,9 +285,11 @@ func (c *Consumer) handleDelivery(
 		return fmt.Errorf("save workflow result failed: %w", err)
 	}
 
+	logWithRunID(runID, "workflow result saved to database")
+
 	// 9.3 更新 Run 状态
 	if err := c.runRepo.UpdateStatus(
-		outbox.RunID,
+		runID,
 		"succeeded",
 	); err != nil {
 
@@ -272,6 +304,8 @@ func (c *Consumer) handleDelivery(
 		return fmt.Errorf("update run status to succeeded failed: %w", err)
 	}
 
+	logWithRunID(runID, "run status updated to succeeded")
+
 	// 10. 持久化成功后，确认消息
 	if err := delivery.Ack(false); err != nil {
 		return fmt.Errorf(
@@ -280,9 +314,9 @@ func (c *Consumer) handleDelivery(
 		)
 	}
 
-	log.Printf(
-		"workflow run %s completed successfully",
-		outbox.RunID,
+	logWithRunID(
+		runID,
+		"workflow completed successfully and message acknowledged",
 	)
 
 	return nil

@@ -1,5 +1,6 @@
 
 from contextlib import asynccontextmanager
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -51,6 +52,14 @@ async def lifespan(app: FastAPI):
         # 5. 应用关闭时释放 Redis 连接
         await redis_client.aclose()
 
+logging.basicConfig(
+    level=logging.INFO,
+    format=(
+        "%(asctime)s %(levelname)s "
+        "[%(name)s] %(message)s"
+    ),
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
 app = FastAPI(
     title="MY agent Service",

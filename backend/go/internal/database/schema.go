@@ -98,5 +98,18 @@ func InitSchema(db *sql.DB) error {
 		return err
 	}
 
+	createIdempotencyRecords:= `
+		CREATE TABLE IF NOT EXISTS idempotency_records (
+			idempotency_key TEXT PRIMARY KEY,
+			request_hash	TEXT NOT NULL,
+			run_id			TEXT NOT NULL,
+			created_at		TEXT NOT NULL,
+			FOREIGN KEY (run_id) REFERENCES runs(run_id)
+		);
+	`
+	if _, err := db.Exec(createIdempotencyRecords); err != nil {
+		return err
+	}
+
 	return nil
 }

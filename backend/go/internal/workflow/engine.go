@@ -1,8 +1,11 @@
+
 package workflow
 
 import (
 	"context"
 	"fmt"
+	"log"
+	"time"
 
 	"my-agent-v2/backend/go/internal/domain"
 	"my-agent-v2/backend/go/internal/executor"
@@ -27,8 +30,20 @@ func (e *Engine) Execute(
 	input interface{},
 ) (interface{}, error) {
 
+	log.Printf(
+		"[run_id=%s] workflow execution started nodes=%d edges=%d",
+		runID,
+		len(wf.Nodes),
+		len(wf.Edges),
+	)
+
 	// 1. 校验 Workflow
 	if err := ValidateWorkflow(wf); err != nil {
+		log.Printf(
+			"[run_id=%s] workflow validation failed: %v",
+			runID,
+			err,
+		)
 		return nil, fmt.Errorf("invalid workflow: %w", err)
 	}
 
@@ -60,30 +75,53 @@ func (e *Engine) Execute(
 	}
 
 	if startNode == nil {
+		log.Printf(
+			"[run_id=%s] workflow start node not found",
+			runID,
+		)
 		return nil, fmt.Errorf("start node not found")
 	}
 
 	// 5. 初始化当前节点
 	currentNode := startNode
 	steps := 0
+
 	// 6. 开始执行 Workflow
 	for {
 
 		// 检查 Context 是否已经取消
 		if err := ctx.Err(); err != nil {
+			log.Printf(
+				"[run_id=%s] workflow execution canceled: %v",
+				runID,
+				err,
+			)
 			return nil, fmt.Errorf("workflow execution canceled: %w", err)
 		}
-		
+
 		if steps >= e.maxSteps {
-			return nil,fmt.Errorf(
-				"workflow execution exceeded max step: %d",e.maxSteps,
+			log.Printf(
+				"[run_id=%s] workflow exceeded max steps=%d",
+				runID,
+				e.maxSteps,
 			)
-			
+			return nil, fmt.Errorf(
+				"workflow execution exceeded max step: %d",
+				e.maxSteps,
+			)
 		}
+
 		steps++
+
 		// 6.1 根据当前节点类型获取 Executor
 		nodeExecutor, err := e.registry.Get(currentNode.Type)
 		if err != nil {
+			log.Printf(
+				"[run_id=%s node_id=%s] get executor failed: %v",
+				runID,
+				currentNode.ID,
+				err,
+			)
 			return nil, fmt.Errorf(
 				"get executor for node %s: %w",
 				currentNode.ID,
@@ -92,8 +130,29 @@ func (e *Engine) Execute(
 		}
 
 		// 6.2 执行当前节点
+		nodeStart := time.Now()
+
+		log.Printf(
+			"[run_id=%s node_id=%s] node execution started type=%s step=%d",
+			runID,
+			currentNode.ID,
+			currentNode.Type,
+			steps,
+		)
+
 		result, err := nodeExecutor.Execute(ctx, *currentNode, execCtx)
+
+		duration := time.Since(nodeStart)
+
 		if err != nil {
+			log.Printf(
+				"[run_id=%s node_id=%s] node execution failed duration=%s error=%v",
+				runID,
+				currentNode.ID,
+				duration,
+				err,
+			)
+
 			return nil, fmt.Errorf(
 				"execute node %s: %w",
 				currentNode.ID,
@@ -102,17 +161,34 @@ func (e *Engine) Execute(
 		}
 
 		if result == nil {
+			log.Printf(
+				"[run_id=%s node_id=%s] executor returned nil result",
+				runID,
+				currentNode.ID,
+			)
 			return nil, fmt.Errorf(
 				"executor returned nil result for node %s",
 				currentNode.ID,
 			)
 		}
 
+		log.Printf(
+			"[run_id=%s node_id=%s] node execution succeeded duration=%s",
+			runID,
+			currentNode.ID,
+			duration,
+		)
+
 		// 6.3 保存当前节点的执行输出
 		execCtx.NodeOutputs[currentNode.ID] = result.Output
 
 		// 6.4 如果当前节点是 EndNode，结束 Workflow
 		if currentNode.Type == domain.NodeTypeEnd {
+			log.Printf(
+				"[run_id=%s] workflow execution completed steps=%d",
+				runID,
+				steps,
+			)
 			return result.Output, nil
 		}
 
@@ -130,6 +206,12 @@ func (e *Engine) Execute(
 		}
 
 		if nextEdge == nil {
+			log.Printf(
+				"[run_id=%s node_id=%s] matching edge not found handle=%s",
+				runID,
+				currentNode.ID,
+				result.NextHandle,
+			)
 			return nil, fmt.Errorf(
 				"no matching edge found for node %s with handle %s",
 				currentNode.ID,
@@ -140,11 +222,25 @@ func (e *Engine) Execute(
 		// 6.6 根据 Edge.Target 查找下一个节点
 		nextNode, exists := nodeMap[nextEdge.Target]
 		if !exists {
+			log.Printf(
+				"[run_id=%s node_id=%s] target node not found target=%s",
+				runID,
+				currentNode.ID,
+				nextEdge.Target,
+			)
 			return nil, fmt.Errorf(
 				"target node %s not found",
 				nextEdge.Target,
 			)
 		}
+
+		log.Printf(
+			"[run_id=%s] workflow transition from=%s to=%s handle=%s",
+			runID,
+			currentNode.ID,
+			nextNode.ID,
+			result.NextHandle,
+		)
 
 		// 6.7 将当前节点的输出传递给下一个节点
 		execCtx.NodeInputs[nextNode.ID] = result.Output

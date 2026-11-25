@@ -1,5 +1,5 @@
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import {
   Alert,
   Box,
@@ -70,7 +70,7 @@ async function pollRunResult(runId: string): Promise<RunStatusResponse> {
     }
 
     if (data.status === "failed") {
-     throw new Error(data.error || "工作流执行失败");
+      throw new Error(data.error || "工作流执行失败");
     }
 
     console.log("Workflow status:", data.status);
@@ -90,6 +90,10 @@ function App() {
 
   const [isRunning, setIsRunning] = useState(false);
 
+  // 保存当前逻辑请求的幂等 Key
+  // 网络异常后再次提交时，复用之前的 Key
+  const idempotencyKeyRef = useRef<string | null>(null);
+
   const [runMessage, setRunMessage] = useState<{
     type: "success" | "error";
     content: string;
@@ -103,11 +107,20 @@ function App() {
       // 1. 获取当前画布工作流
       const savedFlow = saveFlow();
 
-      // 2. 向 Go 后端提交工作流
+      // 2. 获取或生成幂等 Key
+      // 同一次逻辑请求重试时，不重新生成
+      if (!idempotencyKeyRef.current) {
+        idempotencyKeyRef.current = crypto.randomUUID();
+      }
+
+      const idempotencyKey = idempotencyKeyRef.current;
+
+      // 3. 向 Go 后端提交工作流
       const response = await fetch(`${API_BASE_URL}/api/workflow/run`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          "Idempotency-Key": idempotencyKey,
         },
         body: JSON.stringify({
           flow: savedFlow,
@@ -119,6 +132,13 @@ function App() {
       const data = (await response.json()) as WorkflowApiResponse;
 
       if (!response.ok || !data.success) {
+        // 明确的客户端错误，说明需要修正请求
+        // 4xx 可以重新生成 Key
+        // 5xx 保留 Key，因为服务端可能已经提交成功
+        if (response.status >= 400 && response.status < 500) {
+          idempotencyKeyRef.current = null;
+        }
+
         throw new Error(
           data.success ? "工作流提交失败" : data.message,
         );
@@ -128,18 +148,22 @@ function App() {
         throw new Error("Go 后端响应缺少 run_id");
       }
 
+      // 已经拿到 Run ID，后端确认了提交
+      // 下一次主动提交属于新的逻辑请求
+      idempotencyKeyRef.current = null;
+
       console.log("Workflow Submitted:", data);
 
-      // 3. 提示用户正在执行
+      // 5. 提示用户正在执行
       setRunMessage({
         type: "success",
         content: `工作流提交成功，正在等待 DeepSeek 回复...\nRun ID: ${data.run_id}`,
       });
 
-      // 4. 轮询 Go 后端，等待执行结果
+      // 6. 轮询 Go 后端，等待执行结果
       const result = await pollRunResult(data.run_id);
 
-      // 5. 显示大模型最终回复
+      // 7. 显示大模型最终回复
       setRunMessage({
         type: "success",
         content: `${result.result?.content ?? "模型没有返回文本"}\n\n模型: ${
@@ -167,6 +191,10 @@ function App() {
 
   const handleNewConversation = () => {
     setConversationId(crypto.randomUUID());
+
+    // 新会话属于新的逻辑请求
+    idempotencyKeyRef.current = null;
+
     setRunMessage(null);
   };
 
