@@ -24,24 +24,28 @@ func corsMiddleware() gin.HandlerFunc {
 }
 
 func NewRouter(app *bootstrap.App) *gin.Engine {
-	router := gin.Default()
+    router := gin.Default()
 
-	// 注册跨域中间件
-	router.Use(corsMiddleware())
+    router.Use(corsMiddleware())
 
-	handler := NewWorkflowHandler(app.DB)
+    handler := NewWorkflowHandler(app.DB, app.RunRepo)
 
-	router.GET("/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{
-			"status": "ok",
-		})
-	})
+    router.GET("/health", func(c *gin.Context) {
+        c.JSON(200, gin.H{
+            "status": "ok",
+        })
+    })
 
-	router.POST(
-		"/api/workflow/run",
-		rateLimitMiddleware(app.RateLimiter),
-		handler.Run,
-	)
+    router.POST(
+        "/api/workflow/run",
+        rateLimitMiddleware(app.RateLimiter),
+        handler.Run,
+    )
 
-	return router
+    router.GET(
+        "/api/workflow/run/:run_id",
+        handler.GetRun,
+    )
+
+    return router
 }

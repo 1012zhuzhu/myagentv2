@@ -1,3 +1,4 @@
+
 import { useState } from "react";
 import {
   Alert,
@@ -10,6 +11,7 @@ import {
   ThemeProvider,
   createTheme,
 } from "@mui/material";
+
 import Canvas from "./components/Canvas";
 import NodeEditor from "./components/NodeEditor";
 import NodePalette from "./components/NodePalette";
@@ -27,22 +29,67 @@ type WorkflowApiResponse =
       message: string;
     };
 
+interface RunStatusResponse {
+  success: boolean;
+  run_id: string;
+  status: string;
+  result?: {
+    content?: string;
+    model?: string;
+  } | null;
+  error?: string;
+  message?: string;
+}
+
+// Go 后端监听 8080 端口
 const API_BASE_URL =
-  import.meta.env.VITE_API_BASE_URL ?? "http://localhost:3000";
+  import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8080";
 
-// function formatOutput(output: unknown): string {
-//   if (typeof output === "string") {
-//     return output;
-//   }
+const sleep = (ms: number) =>
+  new Promise((resolve) => setTimeout(resolve, ms));
 
-//   return JSON.stringify(output, null, 2) ?? String(output);
-// }
+// 轮询 Go 后端，直到工作流执行完成
+async function pollRunResult(runId: string): Promise<RunStatusResponse> {
+  const maxAttempts = 120;
+
+  for (let i = 0; i < maxAttempts; i++) {
+    await sleep(1000);
+
+    const response = await fetch(
+      `${API_BASE_URL}/api/workflow/run/${runId}`,
+    );
+
+    const data = (await response.json()) as RunStatusResponse;
+
+    if (!response.ok || !data.success) {
+      throw new Error(data.message ?? "查询工作流状态失败");
+    }
+
+    if (data.status === "succeeded") {
+      return data;
+    }
+
+    if (data.status === "failed") {
+     throw new Error(data.error || "工作流执行失败");
+    }
+
+    console.log("Workflow status:", data.status);
+  }
+
+  throw new Error("工作流执行超时，请检查后端日志");
+}
 
 function App() {
   const { isDarkMode, saveFlow } = useCanvasStore();
+
   const [workflowInput, setWorkflowInput] = useState("你好");
-  const [conversationId, serConversationId] = useState(() => crypto.randomUUID())
+
+  const [conversationId, setConversationId] = useState(
+    () => crypto.randomUUID(),
+  );
+
   const [isRunning, setIsRunning] = useState(false);
+
   const [runMessage, setRunMessage] = useState<{
     type: "success" | "error";
     content: string;
@@ -53,8 +100,10 @@ function App() {
     setRunMessage(null);
 
     try {
-      // 前端只发送画布和用户输入。DeepSeek API Key 永远只保存在 server/.env。
+      // 1. 获取当前画布工作流
       const savedFlow = saveFlow();
+
+      // 2. 向 Go 后端提交工作流
       const response = await fetch(`${API_BASE_URL}/api/workflow/run`, {
         method: "POST",
         headers: {
@@ -67,50 +116,58 @@ function App() {
         }),
       });
 
-
       const data = (await response.json()) as WorkflowApiResponse;
 
-      if (!response.ok) {
+      if (!response.ok || !data.success) {
         throw new Error(
-          "message" in data ? data.message : "Workflow submission failed",
+          data.success ? "工作流提交失败" : data.message,
         );
-      }
-
-      if (!data.success) {
-        throw new Error(data.message);
       }
 
       if (!data.run_id) {
         throw new Error("Go 后端响应缺少 run_id");
       }
 
-      setRunMessage({
-        type: "success",
-        content: `工作流提交成功！\nRun ID: ${data.run_id}\n当前状态: ${data.status}`,
-      });
-
       console.log("Workflow Submitted:", data);
 
-      // const data = (await response.json()) as WorkflowApiResponse;
+      // 3. 提示用户正在执行
+      setRunMessage({
+        type: "success",
+        content: `工作流提交成功，正在等待 DeepSeek 回复...\nRun ID: ${data.run_id}`,
+      });
 
-      // if (!response.ok || !data.success) {
-      //   throw new Error(
-      //     data.success ? "Workflow execution failed" : data.message,
-      //   );
-      // }
+      // 4. 轮询 Go 后端，等待执行结果
+      const result = await pollRunResult(data.run_id);
 
-      // const output = formatOutput(data.result.output);
-      // setRunMessage({ type: "success", content: output });
-      // console.log("Workflow Result:", data.result.output);
+      // 5. 显示大模型最终回复
+      setRunMessage({
+        type: "success",
+        content: `${result.result?.content ?? "模型没有返回文本"}\n\n模型: ${
+          result.result?.model ?? "未知"
+        }`,
+      });
+
+      console.log("Workflow Result:", result);
     } catch (error) {
       const message =
-        error instanceof Error ? error.message : "Workflow execution failed";
+        error instanceof Error
+          ? error.message
+          : "Workflow execution failed";
 
-      setRunMessage({ type: "error", content: message });
+      setRunMessage({
+        type: "error",
+        content: message,
+      });
+
       console.error("Workflow Error:", error);
     } finally {
       setIsRunning(false);
     }
+  };
+
+  const handleNewConversation = () => {
+    setConversationId(crypto.randomUUID());
+    setRunMessage(null);
   };
 
   const theme = createTheme({
@@ -119,15 +176,13 @@ function App() {
     },
   });
 
-  const handleNewConversation = () => {
-    serConversationId(crypto.randomUUID())
-  }
-
   return (
     <ThemeProvider theme={theme}>
       <CssBaseline />
+
       <div style={{ display: "flex", height: "100vh" }}>
         <NodePalette />
+
         <div style={{ flex: 1, position: "relative" }}>
           <Box
             sx={{
@@ -143,19 +198,25 @@ function App() {
                 size="small"
                 label="工作流输入"
                 value={workflowInput}
-                onChange={(event) => setWorkflowInput(event.target.value)}
+                onChange={(event) =>
+                  setWorkflowInput(event.target.value)
+                }
                 disabled={isRunning}
               />
+
               <Button
                 variant="contained"
                 onClick={handleRun}
                 disabled={isRunning}
                 startIcon={
-                  isRunning ? <CircularProgress size={16} color="inherit" /> : null
+                  isRunning ? (
+                    <CircularProgress size={16} color="inherit" />
+                  ) : null
                 }
               >
                 {isRunning ? "运行中..." : "Run Workflow"}
               </Button>
+
               <Button
                 variant="outlined"
                 onClick={handleNewConversation}
@@ -163,13 +224,15 @@ function App() {
               >
                 新建会话
               </Button>
+
               {runMessage && (
                 <Alert
                   severity={runMessage.type}
                   sx={{
-                    maxHeight: 180,
+                    maxHeight: 300,
                     overflow: "auto",
                     whiteSpace: "pre-wrap",
+                    wordBreak: "break-word",
                   }}
                 >
                   {runMessage.content}
@@ -177,6 +240,7 @@ function App() {
               )}
             </Stack>
           </Box>
+
           <Canvas />
           <NodeEditor />
         </div>

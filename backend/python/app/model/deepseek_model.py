@@ -8,8 +8,10 @@ from openai import AsyncOpenAI
 load_dotenv()
 
 from app.model.base import ModelResponse, TextResponse, ToolResponse
+
 from app.schemas.message import (
     Message,
+    SystemMessage,
     UserMessage,
     AssistantMessage,
     ToolMessage,
@@ -44,7 +46,13 @@ class DeepSeekModel:
 
         for message in messages:
 
-            if isinstance(message, UserMessage):
+            if isinstance(message, SystemMessage):
+                api_messages.append({
+                    "role": "system",
+                    "content": message.content,
+                })
+
+            elif isinstance(message, UserMessage):
                 api_messages.append({
                     "role": "user",
                     "content": message.content,
@@ -85,7 +93,7 @@ class DeepSeekModel:
                 raise TypeError(
                     f"Unsupported message type: {type(message)}"
                 )
-
+            
         return api_messages
 
     # 将项目内部工具定义转换成 DeepSeek Function 格式

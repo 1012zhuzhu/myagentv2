@@ -7,6 +7,8 @@ type Run struct {
 	ConversationID string
 	WorkflowID     string
 	Status         string
+	Result         string
+	Error          string
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 }

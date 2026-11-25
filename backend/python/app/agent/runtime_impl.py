@@ -1,12 +1,16 @@
 
-from app.agent.runtime import AgentRuntime
 from app.agent.graph import AgentGraph
 from app.agent.nodes.model_node import ModelNode
 from app.agent.nodes.tool_node import ToolNode
 
 from app.model.deepseek_model import DeepSeekModel
+from app.model.mock_model import MockModel
 
-from app.schemas.message import UserMessage
+from app.schemas.message import (
+    SystemMessage,
+    UserMessage,
+    AssistantMessage,
+)
 from app.schemas.tooldefinition import ToolDefinition
 
 from app.tools.setup import create_tool_system
@@ -49,9 +53,23 @@ class LangGraphRuntime:
             if tool.name in allowed_tools
         ]
 
-        # 4. 为本次请求创建节点
+        # 4. 根据前端配置选择模型
+        model_name = request.config.model
+
+        if model_name == "mock":
+            model = MockModel()
+
+        elif model_name in ("deepseek-flash", "deepseek-v4-pro"):
+            model = DeepSeekModel(model=model_name)
+
+        else:
+            raise ValueError(
+                f"Unsupported model: {model_name}"
+            )
+
+        # 5. 为本次请求创建节点
         model_node = ModelNode(
-            model=DeepSeekModel(),
+            model=model,
             tools=available_tools
         )
 
@@ -60,25 +78,35 @@ class LangGraphRuntime:
             allowed_tools=allowed_tools
         )
 
-        # 5. 为本次请求创建 AgentGraph
+        # 6. 为本次请求创建 AgentGraph
         graph = AgentGraph(
             model_node=model_node,
             tool_node=tool_node
         )
 
-        # 6. 将输入转换为用户消息
-        user_message = UserMessage(
-            content=str(request.input)
-        )
+        # 7. 构造本次 Agent 的初始消息
+        messages = [
+            SystemMessage(
+                content=request.config.system_prompt
+            ),
+            UserMessage(
+                content=str(request.input)
+            )
+        ]
 
-        # 7. 执行 AgentGraph
-        result = await graph.invoke([user_message])
+        # 8. 执行 AgentGraph
+        result = await graph.invoke(messages)
 
-        # 8. 获取最终消息
+        # 9. 获取最终消息
         messages = result["messages"]
         final_message = messages[-1]
 
+        if not isinstance(final_message, AssistantMessage):
+            raise ValueError(
+                "Agent did not return a final assistant message"
+            )
+
         return {
             "content": final_message.content,
-            "model": request.config.model
+            "model": model_name
         }

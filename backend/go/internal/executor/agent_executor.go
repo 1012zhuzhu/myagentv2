@@ -23,6 +23,15 @@ type AgentExecuteRequest struct {
 	Config domain.AgentConfig `json:"config"`
 }
 
+
+type PythonErrorResponse struct {
+    Detail struct {
+        Code    string `json:"code"`
+        Message string `json:"message"`
+    } `json:"detail"`
+}
+
+
 type AgentExecuteResponse struct {
 	Output interface{} `json:"output"`
 }
@@ -89,25 +98,39 @@ func (e *AgentExecutor) Execute(
 	}
 	defer resq.Body.Close()
 
+	
 	if resq.StatusCode < 200 || resq.StatusCode >= 300 {
-    errorBody, readErr := io.ReadAll(
-        io.LimitReader(resq.Body, 1024*1024),
-    )
+		errorBody, readErr := io.ReadAll(
+			io.LimitReader(resq.Body, 1024*1024),
+		)
 
-    if readErr != nil {
-        return nil, fmt.Errorf(
-            "python agent service returned status %d; read error body: %w",
-            resq.StatusCode,
-            readErr,
-        )
-    }
+		if readErr != nil {
+			return nil, fmt.Errorf(
+				"python agent service returned status %d; read error body: %w",
+				resq.StatusCode,
+				readErr,
+			)
+		}
 
-    return nil, fmt.Errorf(
-        "python agent service returned status %d: %s",
-        resq.StatusCode,
-        string(errorBody),
-    )
-}
+		var pythonError PythonErrorResponse
+
+		if err := json.Unmarshal(errorBody, &pythonError); err == nil {
+			if pythonError.Detail.Code != "" {
+				return nil, fmt.Errorf(
+					"python agent error [%s]: %s",
+					pythonError.Detail.Code,
+					pythonError.Detail.Message,
+				)
+			}
+		}
+
+		return nil, fmt.Errorf(
+			"python agent service returned status %d: %s",
+			resq.StatusCode,
+			string(errorBody),
+		)
+	}
+
 
 	var agentResponse AgentExecuteResponse
 
