@@ -111,5 +111,34 @@ func InitSchema(db *sql.DB) error {
 		return err
 	}
 
+	
+	createWorkflowEventsSQL := `
+		CREATE TABLE IF NOT EXISTS workflow_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			run_id TEXT NOT NULL,
+			event_seq INTEGER NOT NULL,
+			event_type TEXT NOT NULL,
+			node_id TEXT,
+			payload TEXT NOT NULL DEFAULT '{}',
+			created_at TEXT NOT NULL,
+			UNIQUE(run_id, event_seq),
+			FOREIGN KEY(run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+		);
+	`
+
+	if _, err := db.Exec(createWorkflowEventsSQL); err != nil {
+		return err
+	}
+
+	createWorkflowEventsIndexSQL := `
+		CREATE INDEX IF NOT EXISTS idx_workflow_events_run_seq
+		ON workflow_events(run_id, event_seq);
+	`
+
+	if _, err := db.Exec(createWorkflowEventsIndexSQL); err != nil {
+		return err
+	}
+
+
 	return nil
 }
