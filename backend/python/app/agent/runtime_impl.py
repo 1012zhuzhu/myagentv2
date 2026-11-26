@@ -8,6 +8,7 @@ from app.agent.nodes.tool_node import ToolNode
 from app.model.deepseek_model import DeepSeekModel
 from app.model.mock_model import MockModel
 
+from app.rag import retriever
 from app.schemas.message import (
     SystemMessage,
     UserMessage,
@@ -22,9 +23,9 @@ logger = logging.getLogger(__name__)
 
 
 class LangGraphRuntime:
-    def __init__(self, redis_client):
+    def __init__(self, redis_client,retriever):
         # 1. 初始化工具系统
-        self.registry, self.runner = create_tool_system(redis_client)
+        self.registry, self.runner = create_tool_system(redis_client= redis_client,retriever = retriever,)
 
         # 2. 将内部 Tool 转换为模型可见的 ToolDefinition
         self.tools = [

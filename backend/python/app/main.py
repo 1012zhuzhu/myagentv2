@@ -1,6 +1,7 @@
 
 from contextlib import asynccontextmanager
 import logging
+import os
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -12,10 +13,14 @@ from app.infrastructure.database import (
     recover_interrupted_tasks,
 )
 from app.agent.runtime_impl import LangGraphRuntime
+from app.rag.setup import create_rag_system
 from app.service.agent_service import AgentService
 
+
 BASE_DIR = Path(__file__).resolve().parent.parent
+
 DB_PATH = BASE_DIR / "data" / "agent.db"
+VECTOR_DB_PATH = BASE_DIR / "data" / "lancedb"
 
 
 @asynccontextmanager
@@ -27,7 +32,10 @@ async def lifespan(app: FastAPI):
 
     recovered_tasks = recover_interrupted_tasks(str(DB_PATH))
 
-    print(f"Recovered interrupted index tasks: {recovered_tasks}")
+    logging.info(
+        "Recovered interrupted index tasks: %s",
+        recovered_tasks,
+    )
 
     # 2. 创建 Redis 客户端
     redis_client = Redis.from_url(
@@ -38,19 +46,37 @@ async def lifespan(app: FastAPI):
         health_check_interval=30,
     )
 
-    # 3. 创建 Runtime 和 Service
-    runtime = LangGraphRuntime(redis_client)
-    agent_service = AgentService(runtime=runtime)
-
-    # 4. 将 Service 放入 FastAPI 应用状态
-    app.state.agent_service = agent_service
-    app.state.redis_client = redis_client
-
     try:
+        # 3. 初始化 RAG 系统
+        retriever, index_service = create_rag_system(
+            db_path=str(DB_PATH),
+            vector_db_path=str(VECTOR_DB_PATH),
+            embedding_model=os.environ["EMBEDDING_MODEL"],
+            embedding_model_path=os.environ["EMBEDDING_MODEL_PATH"],
+        )
+
+        # 4. 创建 Runtime 和 Agent Service
+        runtime = LangGraphRuntime(
+            redis_client=redis_client,
+            retriever=retriever,
+        )
+
+        agent_service = AgentService(runtime=runtime)
+
+        # 5. 将 Service 放入 FastAPI 应用状态
+        app.state.agent_service = agent_service
+        app.state.index_service = index_service
+        app.state.redis_client = redis_client
+        app.state.retriever = retriever
+
+        logging.info("RAG system initialized successfully")
+
         yield
+
     finally:
-        # 5. 应用关闭时释放 Redis 连接
+        # 6. 应用关闭时释放 Redis 连接
         await redis_client.aclose()
+
 
 logging.basicConfig(
     level=logging.INFO,

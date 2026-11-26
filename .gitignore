@@ -24,6 +24,9 @@ __pycache__/
 *.sqlite3
 *.sqlite3-*
 
+# Local RAG vector database
+backend/python/data/lancedb/
+
 # Environment variables and local secrets
 .env
 .env.*
