@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"my-agent-v2/backend/go/internal/cancellation"
 	"my-agent-v2/backend/go/internal/domain"
 	"my-agent-v2/backend/go/internal/repository"
 	"my-agent-v2/backend/go/internal/workflow"
@@ -42,17 +43,21 @@ type Consumer struct {
 
 	stopRequested  chan struct{}
 	stopSignalOnce sync.Once
+
+	cancelManager *cancellation.Manager
 }
 
 func NewConsumer(
 	channel *amqp.Channel,
 	engine *workflow.Engine,
 	runRepo *repository.RunRepository,
+	cancelManager *cancellation.Manager,
 ) *Consumer {
 	return &Consumer{
 		channel:       channel,
 		engine:        engine,
 		runRepo:       runRepo,
+		cancelManager: cancelManager,
 		started:       make(chan struct{}),
 		done:          make(chan struct{}),
 		stopRequested: make(chan struct{}),
@@ -164,9 +169,6 @@ func (c *Consumer) Run(ctx context.Context) (runErr error) {
 
 		case delivery, ok := <-deliveries:
 			if !ok {
-				// Cancel() 可能先关闭 deliveries，
-				// 再返回给 StopAccepting。
-				// 等待 StopAccepting 完成后再判断关闭原因。
 				c.acceptMu.Lock()
 				stopped := c.acceptStopped
 				c.acceptMu.Unlock()
@@ -194,13 +196,14 @@ func (c *Consumer) Run(ctx context.Context) (runErr error) {
 				return nil
 			}
 
-			taskCtx, cancel := context.WithCancel(context.Background())
+			// 父 Context：只负责 E08 服务关闭。
+			shutdownCtx, cancel := context.WithCancel(context.Background())
 			c.activeCancel = cancel
 
 			c.mu.Unlock()
 
 			// 串行执行 Workflow。
-			if err := c.handleDelivery(taskCtx, delivery); err != nil {
+			if err := c.handleDelivery(shutdownCtx, delivery); err != nil {
 				log.Printf("handle delivery failed: %v", err)
 
 				if errors.Is(err, ErrDeliverySettlement) {
@@ -228,7 +231,6 @@ func (c *Consumer) Run(ctx context.Context) (runErr error) {
 }
 
 func (c *Consumer) StopAccepting(ctx context.Context) error {
-	// 等待 Consumer 启动，或者确认它已经退出。
 	select {
 	case <-c.started:
 
@@ -242,7 +244,6 @@ func (c *Consumer) StopAccepting(ctx context.Context) error {
 		return ctx.Err()
 	}
 
-	// 避免 Run 已经退出后仍然操作 Channel。
 	select {
 	case <-c.done:
 		c.mu.Lock()
@@ -253,7 +254,6 @@ func (c *Consumer) StopAccepting(ctx context.Context) error {
 	default:
 	}
 
-	// 保证多个停止请求不会并发执行 Cancel。
 	c.acceptMu.Lock()
 	defer c.acceptMu.Unlock()
 
@@ -261,7 +261,6 @@ func (c *Consumer) StopAccepting(ctx context.Context) error {
 		return nil
 	}
 
-	// 获取 acceptMu 后再次检查，避免等待锁期间 Run 已经退出。
 	select {
 	case <-c.done:
 		c.mu.Lock()
@@ -273,10 +272,8 @@ func (c *Consumer) StopAccepting(ctx context.Context) error {
 	}
 
 	// 与 Run 的任务登记互斥。
-	// Cancel 执行期间，Run 不能登记新的 Workflow。
 	c.mu.Lock()
 
-	// 先取消 RabbitMQ Consumer。
 	if err := c.channel.Cancel(consumerTag, false); err != nil {
 		c.mu.Unlock()
 
@@ -286,10 +283,8 @@ func (c *Consumer) StopAccepting(ctx context.Context) error {
 		)
 	}
 
-	// 取消订阅成功后，才正式进入停止状态。
 	c.stopping.Store(true)
 
-	// 通知 Run 退出循环。
 	c.stopSignalOnce.Do(func() {
 		close(c.stopRequested)
 	})
@@ -309,12 +304,11 @@ func (c *Consumer) ForceStop() {
 	// 阻止 Run 登记新的 Workflow。
 	c.stopping.Store(true)
 
-	// 无论有没有活动任务，都通知 Run 退出。
 	c.stopSignalOnce.Do(func() {
 		close(c.stopRequested)
 	})
 
-	// 获取当前活动 Workflow 的取消函数。
+	// 取消父 Context，子 Context 也会随之取消。
 	cancel := c.activeCancel
 
 	c.mu.Unlock()
@@ -341,6 +335,83 @@ func (c *Consumer) Wait(ctx context.Context) error {
 
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+// finishCancellation 负责完成用户主动取消的收尾。
+// 只有数据库状态为 cancelling 时，才执行 cancelling -> cancelled。
+// 状态持久化成功后才 ACK RabbitMQ 消息。
+//
+// handled=true 表示这条消息已经按取消流程处理。
+func (c *Consumer) finishCancellation(
+	delivery amqp.Delivery,
+	runID string,
+) (bool, error) {
+	run, err := c.runRepo.GetRunByID(runID)
+	if err != nil {
+		if nackErr := c.nack(delivery, true); nackErr != nil {
+			return false, fmt.Errorf(
+				"query run during cancellation failed: %v; %w",
+				err,
+				nackErr,
+			)
+		}
+
+		return false, fmt.Errorf(
+			"query run during cancellation failed: %w",
+			err,
+		)
+	}
+
+	switch run.Status {
+	case "cancelling":
+		if err := c.runRepo.MarkRunCancelled(runID); err != nil {
+			if nackErr := c.nack(delivery, true); nackErr != nil {
+				return false, fmt.Errorf(
+					"mark run cancelled failed: %v; %w",
+					err,
+					nackErr,
+				)
+			}
+
+			return false, fmt.Errorf(
+				"mark run cancelled failed: %w",
+				err,
+			)
+		}
+
+		logWithRunID(
+			runID,
+			"run status updated from cancelling to cancelled",
+		)
+
+		if err := c.ack(delivery); err != nil {
+			return false, err
+		}
+
+		logWithRunID(
+			runID,
+			"cancelled workflow message acknowledged",
+		)
+
+		return true, nil
+
+	case "cancelled":
+		// 可能是之前已经完成状态更新，但 ACK 前发生异常。
+		// 再次投递时直接 ACK 即可。
+		logWithRunID(
+			runID,
+			"run already cancelled, acknowledging message",
+		)
+
+		if err := c.ack(delivery); err != nil {
+			return false, err
+		}
+
+		return true, nil
+
+	default:
+		return false, nil
 	}
 }
 
@@ -495,32 +566,107 @@ func (c *Consumer) handleDelivery(
 
 	logWithRunID(runID, "run claimed successfully")
 
-	// 7. 调用 Workflow Engine
+	// 7. 创建当前 Run 的子 Context。
+	// 父 Context 被 E08 取消时，子 Context 也会被取消。
+	// 用户主动取消时，只取消当前 Run 的子 Context。
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+
+	// 注册当前 Run 的取消函数。
+	if err := c.cancelManager.Register(runID, runCancel); err != nil {
+		logWithRunID(
+			runID,
+			"register cancellation failed: %v",
+			err,
+		)
+
+		if nackErr := c.nack(delivery, true); nackErr != nil {
+			return fmt.Errorf(
+				"register cancellation failed: %v; %w",
+				err,
+				nackErr,
+			)
+		}
+
+		return fmt.Errorf("register cancellation failed: %w", err)
+	}
+
+	defer c.cancelManager.Unregister(runID)
+
+	// 注册之后重新检查数据库状态，解决取消请求与注册之间的竞态。
+	run, err := c.runRepo.GetRunByID(runID)
+	if err != nil {
+		if nackErr := c.nack(delivery, true); nackErr != nil {
+			return fmt.Errorf(
+				"query run after cancellation registration failed: %v; %w",
+				err,
+				nackErr,
+			)
+		}
+
+		return fmt.Errorf(
+			"query run after cancellation registration failed: %w",
+			err,
+		)
+	}
+
+	if run.Status == "cancelling" {
+		logWithRunID(
+			runID,
+			"run was already cancelling after registration, cancelling execution context",
+		)
+		runCancel()
+	}
+
+	// 8. 调用 Workflow Engine
 	logWithRunID(runID, "workflow execution started")
 
 	result, executeErr := c.engine.Execute(
-		ctx,
+		runCtx,
 		payload.Workflow,
 		payload.RunID,
 		payload.Input,
 	)
 
-	// 如果 Workflow 是因为外部取消信号而中断，
-	// 不要将它记录为普通业务失败，也不要 ACK 消息。
-	if ctx.Err() != nil {
-		logWithRunID(
-			runID,
-			"workflow interrupted, leaving message unacknowledged: %v",
-			ctx.Err(),
-		)
+	// 9. 检查当前 Run 是否被取消。
+	// 注意：这里检查子 Context，而不是只检查父 Context。
+	if runCtx.Err() != nil {
+		handled, err := c.finishCancellation(delivery, runID)
+		if err != nil {
+			return err
+		}
+
+		if handled {
+			return nil
+		}
+
+		// 数据库没有 cancelling 状态，但父 Context 已取消，
+		// 说明这是 E08 服务关闭，保留原来的不 ACK 行为。
+		if ctx.Err() != nil {
+			logWithRunID(
+				runID,
+				"workflow interrupted by shutdown, leaving message unacknowledged",
+			)
+
+			return fmt.Errorf(
+				"workflow interrupted by shutdown: %w",
+				ctx.Err(),
+			)
+		}
+
+		// 子 Context 被取消，但数据库没有对应的取消请求。
+		// 不擅自修改 Run 状态，重新入队以便后续检查。
+		if err := c.nack(delivery, true); err != nil {
+			return err
+		}
 
 		return fmt.Errorf(
-			"workflow execution interrupted: %w",
-			ctx.Err(),
+			"workflow context cancelled unexpectedly: run_id=%s",
+			runID,
 		)
 	}
 
-	// 8. 工作流执行失败
+	// 10. 工作流执行失败
 	if executeErr != nil {
 		logWithRunID(
 			runID,
@@ -528,14 +674,25 @@ func (c *Consumer) handleDelivery(
 			executeErr,
 		)
 
-		// 8.1 持久化失败状态和错误信息
+		// 10.1 持久化失败状态和错误信息
 		if err := c.runRepo.MarkRunFailed(
 			runID,
 			executeErr.Error(),
 		); err != nil {
 			if errors.Is(err, repository.ErrRunStateConflict) {
-				run, queryErr := c.runRepo.GetRunByID(runID)
+				// 取消请求可能先于失败状态更新成功。
+				handled, cancelErr := c.finishCancellation(
+					delivery,
+					runID,
+				)
+				if cancelErr != nil {
+					return cancelErr
+				}
+				if handled {
+					return nil
+				}
 
+				run, queryErr := c.runRepo.GetRunByID(runID)
 				if queryErr != nil {
 					if nackErr := c.nack(delivery, true); nackErr != nil {
 						return fmt.Errorf(
@@ -583,7 +740,6 @@ func (c *Consumer) handleDelivery(
 
 		logWithRunID(runID, "failure status and error saved to database")
 
-		// 8.2 失败状态已经保存，确认 RabbitMQ 消息
 		if err := c.ack(delivery); err != nil {
 			return err
 		}
@@ -596,10 +752,10 @@ func (c *Consumer) handleDelivery(
 		return nil
 	}
 
-	// 9. 工作流执行成功
+	// 11. 工作流执行成功
 	logWithRunID(runID, "workflow execution produced a result")
 
-	// 9.1 序列化执行结果
+	// 11.1 序列化执行结果
 	resultBytes, err := json.Marshal(result)
 	if err != nil {
 		logWithRunID(
@@ -608,10 +764,33 @@ func (c *Consumer) handleDelivery(
 			err,
 		)
 
-		if saveErr := c.runRepo.MarkRunFailed(
+		saveErr := c.runRepo.MarkRunFailed(
 			runID,
 			fmt.Sprintf("marshal workflow result failed: %v", err),
-		); saveErr != nil {
+		)
+
+		if saveErr != nil {
+			if errors.Is(saveErr, repository.ErrRunStateConflict) {
+				handled, cancelErr := c.finishCancellation(
+					delivery,
+					runID,
+				)
+				if cancelErr != nil {
+					return cancelErr
+				}
+				if handled {
+					return nil
+				}
+
+				run, queryErr := c.runRepo.GetRunByID(runID)
+				if queryErr == nil {
+					switch run.Status {
+					case "succeeded", "failed", "cancelled":
+						return c.ack(delivery)
+					}
+				}
+			}
+
 			if nackErr := c.nack(delivery, true); nackErr != nil {
 				return fmt.Errorf(
 					"marshal result failed: %v; save failure status failed: %v; %w",
@@ -636,9 +815,22 @@ func (c *Consumer) handleDelivery(
 		return c.ack(delivery)
 	}
 
-	// 9.2 原子保存执行结果并更新 Run 状态
+	// 11.2 原子保存执行结果并更新 Run 状态
 	if err := c.runRepo.CompleteRun(runID, string(resultBytes)); err != nil {
 		if errors.Is(err, repository.ErrRunStateConflict) {
+			// 如果取消请求先将状态更新为 cancelling，
+			// 则取消流程优先完成。
+			handled, cancelErr := c.finishCancellation(
+				delivery,
+				runID,
+			)
+			if cancelErr != nil {
+				return cancelErr
+			}
+			if handled {
+				return nil
+			}
+
 			run, queryErr := c.runRepo.GetRunByID(runID)
 			if queryErr != nil {
 				if nackErr := c.nack(delivery, true); nackErr != nil {
@@ -682,7 +874,7 @@ func (c *Consumer) handleDelivery(
 		"workflow result saved and run status updated to succeeded",
 	)
 
-	// 10. 持久化成功后，确认消息
+	// 12. 持久化成功后，确认消息
 	if err := c.ack(delivery); err != nil {
 		return err
 	}

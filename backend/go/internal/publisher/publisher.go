@@ -3,7 +3,6 @@ package publisher
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"my-agent-v2/backend/go/internal/domain"
@@ -134,13 +133,13 @@ func (p *Publisher) Run(ctx context.Context, interval time.Duration) {
         }
 
         if err := p.PublishPending(ctx); err != nil {
-        if errors.Is(err, context.Canceled) {
-            log.Println("publisher received cancellation")
-            return
-        }
+            if ctx.Err() != nil {
+                log.Printf("publisher stopped: %v", ctx.Err())
+                return
+            }
 
-        log.Printf("publish pending outboxes failed: %v", err)
-    }
+            log.Printf("publish pending outboxes failed: %v", err)
+        }
 
         select {
         case <-ctx.Done():

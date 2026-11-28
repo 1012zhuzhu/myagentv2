@@ -41,6 +41,13 @@ interface RunStatusResponse {
   message?: string;
 }
 
+interface CancelRunResponse {
+  success: boolean;
+  run_id: string;
+  status: string;
+  message?: string;
+}
+
 // Go 后端监听 8080 端口
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8080";
@@ -48,7 +55,7 @@ const API_BASE_URL =
 const sleep = (ms: number) =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
-// 轮询 Go 后端，直到工作流执行完成
+// 轮询 Go 后端，直到工作流进入终态
 async function pollRunResult(runId: string): Promise<RunStatusResponse> {
   const maxAttempts = 120;
 
@@ -65,14 +72,20 @@ async function pollRunResult(runId: string): Promise<RunStatusResponse> {
       throw new Error(data.message ?? "查询工作流状态失败");
     }
 
-    if (data.status === "succeeded") {
+    // 成功、取消都是正常终态
+    if (
+      data.status === "succeeded" ||
+      data.status === "cancelled"
+    ) {
       return data;
     }
 
+    // 失败仍然作为异常处理
     if (data.status === "failed") {
       throw new Error(data.error || "工作流执行失败");
     }
 
+    // pending、running、cancelling 都继续轮询
     console.log("Workflow status:", data.status);
   }
 
@@ -90,6 +103,12 @@ function App() {
 
   const [isRunning, setIsRunning] = useState(false);
 
+  // 当前正在执行的 Run ID
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
+
+  // 是否已经提交取消请求
+  const [isCancelling, setIsCancelling] = useState(false);
+
   // 保存当前逻辑请求的幂等 Key
   // 网络异常后再次提交时，复用之前的 Key
   const idempotencyKeyRef = useRef<string | null>(null);
@@ -101,6 +120,8 @@ function App() {
 
   const handleRun = async () => {
     setIsRunning(true);
+    setIsCancelling(false);
+    setActiveRunId(null);
     setRunMessage(null);
 
     try {
@@ -108,7 +129,6 @@ function App() {
       const savedFlow = saveFlow();
 
       // 2. 获取或生成幂等 Key
-      // 同一次逻辑请求重试时，不重新生成
       if (!idempotencyKeyRef.current) {
         idempotencyKeyRef.current = crypto.randomUUID();
       }
@@ -132,7 +152,6 @@ function App() {
       const data = (await response.json()) as WorkflowApiResponse;
 
       if (!response.ok || !data.success) {
-        // 明确的客户端错误，说明需要修正请求
         // 4xx 可以重新生成 Key
         // 5xx 保留 Key，因为服务端可能已经提交成功
         if (response.status >= 400 && response.status < 500) {
@@ -149,21 +168,31 @@ function App() {
       }
 
       // 已经拿到 Run ID，后端确认了提交
-      // 下一次主动提交属于新的逻辑请求
       idempotencyKeyRef.current = null;
+
+      // 保存当前 Run ID，供取消按钮使用
+      setActiveRunId(data.run_id);
 
       console.log("Workflow Submitted:", data);
 
-      // 5. 提示用户正在执行
       setRunMessage({
         type: "success",
         content: `工作流提交成功，正在等待 DeepSeek 回复...\nRun ID: ${data.run_id}`,
       });
 
-      // 6. 轮询 Go 后端，等待执行结果
+      // 5. 轮询 Go 后端
       const result = await pollRunResult(data.run_id);
 
-      // 7. 显示大模型最终回复
+      // 6. 根据最终状态展示结果
+      if (result.status === "cancelled") {
+        setRunMessage({
+          type: "success",
+          content: `工作流已取消\nRun ID: ${data.run_id}`,
+        });
+
+        return;
+      }
+
       setRunMessage({
         type: "success",
         content: `${result.result?.content ?? "模型没有返回文本"}\n\n模型: ${
@@ -186,6 +215,65 @@ function App() {
       console.error("Workflow Error:", error);
     } finally {
       setIsRunning(false);
+      setIsCancelling(false);
+      setActiveRunId(null);
+    }
+  };
+
+  // 主动取消当前 Run
+  const handleCancel = async () => {
+    if (!activeRunId || isCancelling) {
+      return;
+    }
+
+    const runId = activeRunId;
+
+    setIsCancelling(true);
+
+    setRunMessage({
+      type: "success",
+      content: `正在请求取消工作流...\nRun ID: ${runId}`,
+    });
+
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/workflow/run/${runId}/cancel`,
+        {
+          method: "POST",
+        },
+      );
+
+      const data = (await response.json()) as CancelRunResponse;
+
+      if (!response.ok || !data.success) {
+        throw new Error(data.message ?? "取消工作流请求失败");
+      }
+
+      console.log("Workflow cancellation requested:", data);
+
+      setRunMessage({
+        type: "success",
+        content: `取消请求已提交，正在等待执行结束...\nRun ID: ${runId}\n当前状态: ${data.status}`,
+      });
+
+      // 注意：
+      // 这里不直接结束 Run。
+      // handleRun 中的 pollRunResult 会继续轮询，
+      // 直到后端返回 cancelled、succeeded 或 failed。
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "取消工作流失败";
+
+      setIsCancelling(false);
+
+      setRunMessage({
+        type: "error",
+        content: message,
+      });
+
+      console.error("Workflow Cancellation Error:", error);
     }
   };
 
@@ -244,6 +332,17 @@ function App() {
               >
                 {isRunning ? "运行中..." : "Run Workflow"}
               </Button>
+
+              {isRunning && activeRunId && (
+                <Button
+                  variant="contained"
+                  color="error"
+                  onClick={handleCancel}
+                  disabled={isCancelling}
+                >
+                  {isCancelling ? "正在取消..." : "取消执行"}
+                </Button>
+              )}
 
               <Button
                 variant="outlined"

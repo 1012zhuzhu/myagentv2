@@ -7,7 +7,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from redis.asyncio import Redis
 
-from app.api.agent import router as agent_router
+from app.api.router import router as agent_router
 from app.infrastructure.database import (
     init_db,
     recover_interrupted_tasks,

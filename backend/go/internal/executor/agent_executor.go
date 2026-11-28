@@ -22,10 +22,10 @@ type AgentExecutor struct {
 }
 
 type AgentExecuteRequest struct {
-	RunID  string              `json:"run_id"`
-	NodeID string              `json:"node_id"`
-	Input  interface{}         `json:"input"`
-	Config domain.AgentConfig  `json:"config"`
+	RunID  string             `json:"run_id"`
+	NodeID string             `json:"node_id"`
+	Input  interface{}        `json:"input"`
+	Config domain.AgentConfig `json:"config"`
 }
 
 type PythonErrorResponse struct {
@@ -80,6 +80,11 @@ func (e *AgentExecutor) Execute(
 
 	if execCtx == nil {
 		return nil, fmt.Errorf("execution context cannot be nil")
+	}
+
+	// 执行前检查 Context，避免已取消的任务继续发起请求。
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("agent execution canceled: %w", err)
 	}
 
 	config, err := parseAgentConfig(node.Config)
@@ -165,6 +170,11 @@ func (e *AgentExecutor) Execute(
 	}
 
 	defer resq.Body.Close()
+
+	// 请求返回后再次检查，避免取消与响应返回同时发生时误报成功。
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("agent execution canceled: %w", err)
+	}
 
 	if resq.StatusCode < 200 || resq.StatusCode >= 300 {
 		log.Printf(

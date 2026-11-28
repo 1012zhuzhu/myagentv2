@@ -159,7 +159,7 @@ func (r *RunRepository) CompleteRun(
     return nil
 }
 
-// MarkRunFailed 原子保存失败原因并更新状态
+
 // MarkRunFailed 原子保存失败原因并更新状态
 func (r *RunRepository) MarkRunFailed(
     runID string,
@@ -195,4 +195,106 @@ func (r *RunRepository) MarkRunFailed(
 	}
 
     return nil
+}
+
+
+// RequestRunCancellation 请求取消一个 Run。
+// pending -> cancelled
+// running -> cancelling
+// 其他状态保持不变，返回当前状态。
+func (r *RunRepository) RequestRunCancellation(
+	runID string,
+) (string, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	// 尚未执行：直接取消。
+	result, err := r.db.Exec(`
+		UPDATE runs
+		SET status = ?, updated_at = ?
+		WHERE run_id = ? AND status = ?
+	`,
+		"cancelled",
+		now,
+		runID,
+		"pending",
+	)
+	if err != nil {
+		return "", fmt.Errorf("cancel pending run: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return "", fmt.Errorf("get pending cancellation rows affected: %w", err)
+	}
+
+	if rowsAffected == 1 {
+		return "cancelled", nil
+	}
+
+	// 已经开始执行：先记录取消意图。
+	result, err = r.db.Exec(`
+		UPDATE runs
+		SET status = ?, updated_at = ?
+		WHERE run_id = ? AND status = ?
+	`,
+		"cancelling",
+		now,
+		runID,
+		"running",
+	)
+	if err != nil {
+		return "", fmt.Errorf("cancel running run: %w", err)
+	}
+
+	rowsAffected, err = result.RowsAffected()
+	if err != nil {
+		return "", fmt.Errorf("get running cancellation rows affected: %w", err)
+	}
+
+	if rowsAffected == 1 {
+		return "cancelling", nil
+	}
+
+	// 可能已经结束，也可能正在取消。
+	// 查询当前状态，让上层决定如何响应。
+	run, err := r.GetRunByID(runID)
+	if err != nil {
+		return "", fmt.Errorf("get run after cancellation request: %w", err)
+	}
+
+	return run.Status, nil
+}
+
+
+// MarkRunCancelled 将正在取消的 Run 标记为已取消。
+func (r *RunRepository) MarkRunCancelled(runID string) error {
+	result, err := r.db.Exec(`
+		UPDATE runs
+		SET status = ?, updated_at = ?
+		WHERE run_id = ? AND status = ?
+	`,
+		"cancelled",
+		time.Now().UTC().Format(time.RFC3339),
+		runID,
+		"cancelling",
+	)
+	if err != nil {
+		return fmt.Errorf("mark run cancelled: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("get cancelled run rows affected: %w", err)
+	}
+
+	if rowsAffected != 1 {
+		return fmt.Errorf(
+			"%w: mark run cancelled rejected, run_id=%s, affected=%d",
+			ErrRunStateConflict,
+			runID,
+			rowsAffected,
+		)
+	}
+
+	return nil
 }

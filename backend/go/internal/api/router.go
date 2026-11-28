@@ -1,3 +1,4 @@
+
 package api
 
 import (
@@ -24,28 +25,38 @@ func corsMiddleware() gin.HandlerFunc {
 }
 
 func NewRouter(app *bootstrap.App) *gin.Engine {
-    router := gin.Default()
+	router := gin.Default()
 
-    router.Use(corsMiddleware())
+	router.Use(corsMiddleware())
 
-    handler := NewWorkflowHandler(app.DB, app.RunRepo)
+	handler := NewWorkflowHandler(
+		app.DB,
+		app.RunRepo,
+		app.CancelManager,
+	)
 
-    router.GET("/health", func(c *gin.Context) {
-        c.JSON(200, gin.H{
-            "status": "ok",
-        })
-    })
+	router.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"status": "ok",
+		})
+	})
 
-    router.POST(
-        "/api/workflow/run",
-        rateLimitMiddleware(app.RateLimiter),
-        handler.Run,
-    )
+	router.POST(
+		"/api/workflow/run",
+		rateLimitMiddleware(app.RateLimiter),
+		handler.Run,
+	)
 
-    router.GET(
-        "/api/workflow/run/:run_id",
-        handler.GetRun,
-    )
+	router.GET(
+		"/api/workflow/run/:run_id",
+		handler.GetRun,
+	)
 
-    return router
+	// 请求取消指定 Run
+	router.POST(
+		"/api/workflow/run/:run_id/cancel",
+		handler.CancelRun,
+	)
+
+	return router
 }

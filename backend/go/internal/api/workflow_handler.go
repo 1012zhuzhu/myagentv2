@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"my-agent-v2/backend/go/internal/cancellation"
 	"my-agent-v2/backend/go/internal/domain"
 	"my-agent-v2/backend/go/internal/repository"
 
@@ -26,17 +27,20 @@ type RunWorkflowRequest struct {
 }
 
 type WorkflowHandler struct {
-	db      *sql.DB
-	runRepo *repository.RunRepository
+	db            *sql.DB
+	runRepo       *repository.RunRepository
+	cancelManager *cancellation.Manager
 }
 
 func NewWorkflowHandler(
 	db *sql.DB,
 	runRepo *repository.RunRepository,
+	cancelManager *cancellation.Manager,
 ) *WorkflowHandler {
 	return &WorkflowHandler{
-		db:      db,
-		runRepo: runRepo,
+		db:            db,
+		runRepo:       runRepo,
+		cancelManager: cancelManager,
 	}
 }
 
@@ -90,6 +94,89 @@ func (h *WorkflowHandler) GetRun(c *gin.Context) {
 		"error":   run.Error,
 	})
 }
+
+// CancelRun 请求取消指定 Run。
+
+// CancelRun 请求取消指定 Run。
+func (h *WorkflowHandler) CancelRun(c *gin.Context) {
+	runID := c.Param("run_id")
+
+	if runID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "run_id is required",
+		})
+		return
+	}
+
+	// 1. 先持久化取消请求。
+	// pending -> cancelled
+	// running -> cancelling
+	status, err := h.runRepo.RequestRunCancellation(runID)
+
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusNotFound, gin.H{
+			"success": false,
+			"message": "run not found",
+		})
+		return
+	}
+
+	if err != nil {
+		log.Printf(
+			"[run_id=%s] request cancellation failed: %v",
+			runID,
+			err,
+		)
+
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "failed to request cancellation",
+		})
+		return
+	}
+
+	// 2. 只有 cancelling 状态才需要通知正在运行的 Consumer。
+	if status == "cancelling" {
+		if h.cancelManager == nil {
+			// 数据库中的取消请求已经持久化。
+			// Consumer 注册取消函数后的数据库复查，
+			// 以及执行结束时的状态冲突处理，可以兜底完成取消。
+			log.Printf(
+				"[run_id=%s] WARNING: cancellation manager is nil; cancellation notification skipped",
+				runID,
+			)
+		} else {
+			notified := h.cancelManager.Cancel(runID)
+
+			log.Printf(
+				"[run_id=%s] cancellation requested manager_notified=%t",
+				runID,
+				notified,
+			)
+		}
+	}
+
+	// 3. 根据当前状态返回响应。
+	// cancelling 表示取消请求已接受，但执行流程可能还没收尾。
+	if status == "cancelling" {
+		c.JSON(http.StatusAccepted, gin.H{
+			"success": true,
+			"run_id":  runID,
+			"status":  status,
+			"message": "cancellation requested",
+		})
+		return
+	}
+
+	// cancelled 或其他终态：当前请求不再需要等待取消处理。
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"run_id":  runID,
+		"status":  status,
+	})
+}
+
 
 // requestHash 计算一次逻辑请求的内容摘要。
 func requestHash(req RunWorkflowRequest) (string, error) {
@@ -297,8 +384,6 @@ func (h *WorkflowHandler) Run(c *gin.Context) {
 			err,
 		)
 
-		// 可能是另一个并发请求抢先创建了相同 Key。
-		// 再查一次，若存在则返回原 Run。
 		if h.returnExistingRun(c, key, hash) {
 			return
 		}

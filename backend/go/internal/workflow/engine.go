@@ -190,6 +190,24 @@ func (e *Engine) Execute(
 
 		duration := time.Since(nodeStart)
 
+		// 节点执行结束后再次检查 Context。
+		// 防止节点在取消信号到达后仍返回成功结果，
+		// 导致 Engine 继续推进 Workflow。
+		if err := ctx.Err(); err != nil {
+			log.Printf(
+				"[run_id=%s node_id=%s] node execution interrupted: %v",
+				runID,
+				currentNode.ID,
+				err,
+			)
+
+			return nil, fmt.Errorf(
+				"workflow execution canceled while node %s was running: %w",
+				currentNode.ID,
+				err,
+			)
+		}
+
 		if executeErr != nil {
 			log.Printf(
 				"[run_id=%s node_id=%s] node execution failed duration=%s error=%v",
