@@ -3,6 +3,7 @@ package publisher
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"my-agent-v2/backend/go/internal/domain"
@@ -26,11 +27,17 @@ func NewPublisher(
 }
 
 func (p *Publisher) PublishPending(ctx context.Context) error {
-	outboxs, err := p.outboxRepo.GetPendingOutboxes()
-	if err != nil {
+	
+	if err := ctx.Err(); err != nil {
 		log.Printf("get pending outboxes failed: %v", err)
 		return err
 	}
+
+    outboxs, err := p.outboxRepo.GetPendingOutboxes(ctx)
+    if err != nil {
+        log.Printf("get pending outboxes failed: %v", err)
+        return err
+    }
 
 	if len(outboxs) == 0 {
 		return nil
@@ -39,10 +46,17 @@ func (p *Publisher) PublishPending(ctx context.Context) error {
 	log.Printf("pending outboxes loaded count=%d", len(outboxs))
 
 	for _,outbox :=  range outboxs {
-		err := p.publishOne(ctx,outbox)
-		if err != nil {
-			return fmt.Errorf("publish outbox %s failed: %w", outbox.EventID, err)
-		}
+		if err := ctx.Err(); err != nil {
+            return err
+        }
+
+        if err := p.publishOne(ctx, outbox); err != nil {
+            return fmt.Errorf(
+                "publish outbox %s failed: %w",
+                outbox.EventID,
+                err,
+            )
+        }
 	}
 
 	return nil
@@ -81,7 +95,14 @@ func (p *Publisher) publishOne(
 
     publishedAt := time.Now()
 
+    publishCtx, cancel := context.WithTimeout(
+        context.Background(),
+        3*time.Second,
+    )
+    defer cancel()
+
     err = p.outboxRepo.MarkPublished(
+        publishCtx,
         outbox.EventID,
         publishedAt,
     )
@@ -95,24 +116,37 @@ func (p *Publisher) publishOne(
     return nil
 }
 
-func(p *Publisher) Run(ctx context.Context, interval time.Duration) {
-	if interval <= 0 {
-		interval = time.Second
-	}
+func (p *Publisher) Run(ctx context.Context, interval time.Duration) {
+    if interval <= 0 {
+        interval = time.Second
+    }
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+    ticker := time.NewTicker(interval)
+    defer ticker.Stop()
 
-	for {
-		if err := p.PublishPending(ctx); err != nil {
-			log.Printf("publish pending outboxes failed :%v", err)
-		}
+    for {
+        // 发布之前，先检查是否已经收到退出信号
+        select {
+        case <-ctx.Done():
+            log.Println("publisher stopped")
+            return
+        default:
+        }
 
-		select {
-		case <-ctx.Done():
-			log.Println("publisher stopped")
-			return
-		case <-ticker.C:
-		}
-	}
+        if err := p.PublishPending(ctx); err != nil {
+        if errors.Is(err, context.Canceled) {
+            log.Println("publisher received cancellation")
+            return
+        }
+
+        log.Printf("publish pending outboxes failed: %v", err)
+    }
+
+        select {
+        case <-ctx.Done():
+            log.Println("publisher stopped")
+            return
+        case <-ticker.C:
+        }
+    }
 }

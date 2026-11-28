@@ -3,6 +3,7 @@ package workflow
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"time"
@@ -11,16 +12,56 @@ import (
 	"my-agent-v2/backend/go/internal/executor"
 )
 
-type Engine struct {
-	registry *executor.Registry
-	maxSteps int
+// EventWriter 定义 Engine 所需的最小事件写入能力。
+// repository.EventRepository 实现了这个接口。
+type EventWriter interface {
+	AppendEvent(event *domain.WorkflowEvent) error
 }
 
-func NewEngine(registry *executor.Registry) *Engine {
+type Engine struct {
+	registry  *executor.Registry
+	eventRepo EventWriter
+	maxSteps  int
+}
+
+func NewEngine(
+	registry *executor.Registry,
+	eventRepo EventWriter,
+) *Engine {
 	return &Engine{
-		registry: registry,
-		maxSteps: 50,
+		registry:  registry,
+		eventRepo: eventRepo,
+		maxSteps:  50,
 	}
+}
+
+func (e *Engine) appendNodeEvent(
+	runID string,
+	nodeID string,
+	eventType string,
+	payload interface{},
+) error {
+	if e.eventRepo == nil {
+		return fmt.Errorf("event writer is not configured")
+	}
+
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal %s payload: %w", eventType, err)
+	}
+
+	event := &domain.WorkflowEvent{
+		RunID:     runID,
+		NodeID:    nodeID,
+		EventType: eventType,
+		Payload:   string(payloadBytes),
+	}
+
+	if err := e.eventRepo.AppendEvent(event); err != nil {
+		return fmt.Errorf("append workflow event %s: %w", eventType, err)
+	}
+
+	return nil
 }
 
 func (e *Engine) Execute(
@@ -39,11 +80,7 @@ func (e *Engine) Execute(
 
 	// 1. 校验 Workflow
 	if err := ValidateWorkflow(wf); err != nil {
-		log.Printf(
-			"[run_id=%s] workflow validation failed: %v",
-			runID,
-			err,
-		)
+		log.Printf("[run_id=%s] workflow validation failed: %v", runID, err)
 		return nil, fmt.Errorf("invalid workflow: %w", err)
 	}
 
@@ -75,21 +112,14 @@ func (e *Engine) Execute(
 	}
 
 	if startNode == nil {
-		log.Printf(
-			"[run_id=%s] workflow start node not found",
-			runID,
-		)
 		return nil, fmt.Errorf("start node not found")
 	}
 
-	// 5. 初始化当前节点
 	currentNode := startNode
 	steps := 0
 
-	// 6. 开始执行 Workflow
+	// 5. 开始执行 Workflow
 	for {
-
-		// 检查 Context 是否已经取消
 		if err := ctx.Err(); err != nil {
 			log.Printf(
 				"[run_id=%s] workflow execution canceled: %v",
@@ -100,11 +130,6 @@ func (e *Engine) Execute(
 		}
 
 		if steps >= e.maxSteps {
-			log.Printf(
-				"[run_id=%s] workflow exceeded max steps=%d",
-				runID,
-				e.maxSteps,
-			)
 			return nil, fmt.Errorf(
 				"workflow execution exceeded max step: %d",
 				e.maxSteps,
@@ -113,7 +138,7 @@ func (e *Engine) Execute(
 
 		steps++
 
-		// 6.1 根据当前节点类型获取 Executor
+		// 5.1 获取当前节点 Executor
 		nodeExecutor, err := e.registry.Get(currentNode.Type)
 		if err != nil {
 			log.Printf(
@@ -129,7 +154,24 @@ func (e *Engine) Execute(
 			)
 		}
 
-		// 6.2 执行当前节点
+		// 5.2 持久化 node.started
+		if err := e.appendNodeEvent(
+			runID,
+			currentNode.ID,
+			"node.started",
+			map[string]interface{}{
+				"node_type": currentNode.Type,
+				"step":      steps,
+			},
+		); err != nil {
+			return nil, fmt.Errorf(
+				"record node.started for node %s: %w",
+				currentNode.ID,
+				err,
+			)
+		}
+
+		// 5.3 执行节点
 		nodeStart := time.Now()
 
 		log.Printf(
@@ -140,35 +182,89 @@ func (e *Engine) Execute(
 			steps,
 		)
 
-		result, err := nodeExecutor.Execute(ctx, *currentNode, execCtx)
+		result, executeErr := nodeExecutor.Execute(
+			ctx,
+			*currentNode,
+			execCtx,
+		)
 
 		duration := time.Since(nodeStart)
 
-		if err != nil {
+		if executeErr != nil {
 			log.Printf(
 				"[run_id=%s node_id=%s] node execution failed duration=%s error=%v",
 				runID,
 				currentNode.ID,
 				duration,
-				err,
+				executeErr,
 			)
+
+			eventErr := e.appendNodeEvent(
+				runID,
+				currentNode.ID,
+				"node.failed",
+				map[string]interface{}{
+					"duration_ms": duration.Milliseconds(),
+					"error":       executeErr.Error(),
+				},
+			)
+
+			if eventErr != nil {
+				return nil, fmt.Errorf(
+					"execute node %s failed: %v; record node.failed failed: %w",
+					currentNode.ID,
+					executeErr,
+					eventErr,
+				)
+			}
 
 			return nil, fmt.Errorf(
 				"execute node %s: %w",
 				currentNode.ID,
-				err,
+				executeErr,
 			)
 		}
 
 		if result == nil {
-			log.Printf(
-				"[run_id=%s node_id=%s] executor returned nil result",
-				runID,
-				currentNode.ID,
-			)
-			return nil, fmt.Errorf(
+			nodeErr := fmt.Errorf(
 				"executor returned nil result for node %s",
 				currentNode.ID,
+			)
+
+			eventErr := e.appendNodeEvent(
+				runID,
+				currentNode.ID,
+				"node.failed",
+				map[string]interface{}{
+					"duration_ms": duration.Milliseconds(),
+					"error":       nodeErr.Error(),
+				},
+			)
+
+			if eventErr != nil {
+				return nil, fmt.Errorf(
+					"%v; record node.failed failed: %w",
+					nodeErr,
+					eventErr,
+				)
+			}
+
+			return nil, nodeErr
+		}
+
+		// 5.4 节点执行成功，持久化 node.completed
+		if err := e.appendNodeEvent(
+			runID,
+			currentNode.ID,
+			"node.completed",
+			map[string]interface{}{
+				"duration_ms": duration.Milliseconds(),
+			},
+		); err != nil {
+			return nil, fmt.Errorf(
+				"record node.completed for node %s: %w",
+				currentNode.ID,
+				err,
 			)
 		}
 
@@ -179,10 +275,10 @@ func (e *Engine) Execute(
 			duration,
 		)
 
-		// 6.3 保存当前节点的执行输出
+		// 5.5 保存当前节点输出
 		execCtx.NodeOutputs[currentNode.ID] = result.Output
 
-		// 6.4 如果当前节点是 EndNode，结束 Workflow
+		// 5.6 EndNode：结束 Workflow
 		if currentNode.Type == domain.NodeTypeEnd {
 			log.Printf(
 				"[run_id=%s] workflow execution completed steps=%d",
@@ -192,7 +288,7 @@ func (e *Engine) Execute(
 			return result.Output, nil
 		}
 
-		// 6.5 根据当前节点和 NextHandle 查找下一条 Edge
+		// 5.7 查找下一条 Edge
 		var nextEdge *domain.Edge
 
 		for i := range wf.Edges {
@@ -206,12 +302,6 @@ func (e *Engine) Execute(
 		}
 
 		if nextEdge == nil {
-			log.Printf(
-				"[run_id=%s node_id=%s] matching edge not found handle=%s",
-				runID,
-				currentNode.ID,
-				result.NextHandle,
-			)
 			return nil, fmt.Errorf(
 				"no matching edge found for node %s with handle %s",
 				currentNode.ID,
@@ -219,15 +309,9 @@ func (e *Engine) Execute(
 			)
 		}
 
-		// 6.6 根据 Edge.Target 查找下一个节点
+		// 5.8 查找下一个节点
 		nextNode, exists := nodeMap[nextEdge.Target]
 		if !exists {
-			log.Printf(
-				"[run_id=%s node_id=%s] target node not found target=%s",
-				runID,
-				currentNode.ID,
-				nextEdge.Target,
-			)
 			return nil, fmt.Errorf(
 				"target node %s not found",
 				nextEdge.Target,
@@ -242,10 +326,9 @@ func (e *Engine) Execute(
 			result.NextHandle,
 		)
 
-		// 6.7 将当前节点的输出传递给下一个节点
+		// 5.9 将输出传递给下一个节点
 		execCtx.NodeInputs[nextNode.ID] = result.Output
 
-		// 6.8 更新当前节点
 		currentNode = nextNode
 	}
 }

@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"context"
 	"database/sql"
 	"my-agent-v2/backend/go/internal/domain"
 	"time"
@@ -51,10 +52,10 @@ func (r *OutboxRepository) CreateOutbox(outbox domain.Outbox) error {
 	return nil
 }   
 
-func (r *OutboxRepository) GetPendingOutboxes() ([]domain.Outbox,error){
+func (r *OutboxRepository) GetPendingOutboxes(ctx context.Context) ([]domain.Outbox,error){
 	var Outbox []domain.Outbox
 
-	rows, err := r.db.Query(`
+	rows, err := r.db.QueryContext(ctx,`
 		SELECT event_id, run_id, event_type, payload, status, created_at, published_at
 		FROM outbox
 		WHERE status = ?
@@ -110,10 +111,10 @@ func (r *OutboxRepository) GetPendingOutboxes() ([]domain.Outbox,error){
 	return Outbox, nil
 }
 
-func (r *OutboxRepository) MarkPublished(eventID string, publishedAt time.Time) error {
+func (r *OutboxRepository) MarkPublished(ctx context.Context, eventID string, publishedAt time.Time) error {
 		publish := publishedAt.Format(time.RFC3339)
 
-		result,err := r.db.Exec(
+		result,err := r.db.ExecContext(ctx,
 			`
 			UPDATE outbox
 			SET status =?, published_at = ?

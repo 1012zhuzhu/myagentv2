@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"fmt"
 	"my-agent-v2/backend/go/internal/domain"
 	"time"
 )
@@ -94,44 +95,104 @@ func (r *RunRepository) ClaimPendingRun(runID string) (bool, error) {
 }
 
 // UpdateStatus 更新 Run 状态
-func (r *RunRepository) UpdateStatus(runID string, status string) error {
-	_, err := r.db.Exec(`
-		UPDATE runs
-		SET status = ?, updated_at = ?
-		WHERE run_id = ?
-	`,
-		status,
-		time.Now().UTC().Format(time.RFC3339),
-		runID,
-	)
-	return err
-}
+// func (r *RunRepository) UpdateStatus(runID string, status string) error {
+// 	_, err := r.db.Exec(`
+// 		UPDATE runs
+// 		SET status = ?, updated_at = ?
+// 		WHERE run_id = ?
+// 	`,
+// 		status,
+// 		time.Now().UTC().Format(time.RFC3339),
+// 		runID,
+// 	)
+// 	return err
+// }
 
 // SaveResult 保存成功执行结果
-func (r *RunRepository) SaveResult(runID string, result string) error {
-	_, err := r.db.Exec(`
-		UPDATE runs
-		SET result = ?, updated_at = ?
-		WHERE run_id = ?
-	`,
-		result,
-		time.Now().UTC().Format(time.RFC3339),
-		runID,
-	)
-	return err
+// func (r *RunRepository) SaveResult(runID string, result string) error {
+// 	_, err := r.db.Exec(`
+// 		UPDATE runs
+// 		SET result = ?, updated_at = ?
+// 		WHERE run_id = ?
+// 	`,
+// 		result,
+// 		time.Now().UTC().Format(time.RFC3339),
+// 		runID,
+// 	)
+// 	return err
+// }
+
+// CompleteRun 原子保存执行结果并更新 Run 状态
+func (r *RunRepository) CompleteRun(
+    runID string,
+    result string,
+) error {
+    updateResult, err := r.db.Exec(`
+        UPDATE runs
+        SET result = ?, status = ?, updated_at = ?
+        WHERE run_id = ? AND status = ?
+    `,
+        result,
+        "succeeded",
+        time.Now().UTC().Format(time.RFC3339),
+        runID,
+        "running",
+    )
+    if err != nil {
+        return fmt.Errorf("complete run failed: %w", err)
+    }
+
+    rowsAffected, err := updateResult.RowsAffected()
+    if err != nil {
+        return fmt.Errorf("get complete run rows affected: %w", err)
+    }
+
+	if rowsAffected != 1 {
+		return fmt.Errorf(
+			"%w: complete run rejected, run_id=%s, affected=%d",
+			ErrRunStateConflict,
+			runID,
+			rowsAffected,
+		)
+	}
+
+    return nil
 }
 
 // MarkRunFailed 原子保存失败原因并更新状态
-func (r *RunRepository) MarkRunFailed(runID string, errorMessage string) error {
-	_, err := r.db.Exec(`
-		UPDATE runs
-		SET status = ?, error = ?, updated_at = ?
-		WHERE run_id = ?
-	`,
-		"failed",
-		errorMessage,
-		time.Now().UTC().Format(time.RFC3339),
-		runID,
-	)
-	return err
+// MarkRunFailed 原子保存失败原因并更新状态
+func (r *RunRepository) MarkRunFailed(
+    runID string,
+    errorMessage string,
+) error {
+    result, err := r.db.Exec(`
+        UPDATE runs
+        SET status = ?, error = ?, updated_at = ?
+        WHERE run_id = ? AND status = ?
+    `,
+        "failed",
+        errorMessage,
+        time.Now().UTC().Format(time.RFC3339),
+        runID,
+        "running",
+    )
+    if err != nil {
+        return fmt.Errorf("mark run failed: %w", err)
+    }
+
+    rowsAffected, err := result.RowsAffected()
+    if err != nil {
+        return fmt.Errorf("get failed run rows affected: %w", err)
+    }
+
+    if rowsAffected != 1 {
+		return fmt.Errorf(
+			"%w: mark run failed rejected, run_id=%s, affected=%d",
+			ErrRunStateConflict,
+			runID,
+			rowsAffected,
+		)
+	}
+
+    return nil
 }

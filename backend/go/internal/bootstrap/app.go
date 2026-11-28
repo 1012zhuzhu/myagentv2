@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"errors"
 	"log"
+	"os"
+
 	"my-agent-v2/backend/go/internal/cache"
 	"my-agent-v2/backend/go/internal/consumer"
 	"my-agent-v2/backend/go/internal/database"
@@ -13,7 +15,6 @@ import (
 	"my-agent-v2/backend/go/internal/ratelimit"
 	"my-agent-v2/backend/go/internal/repository"
 	"my-agent-v2/backend/go/internal/workflow"
-	"os"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -22,6 +23,7 @@ type App struct {
 	Engine     *workflow.Engine
 	DB         *sql.DB
 	RunRepo    *repository.RunRepository
+	EventRepo  *repository.EventRepository
 	OutboxRepo *repository.OutboxRepository
 
 	RabbitMQ  *publisher.RabbitMQClient
@@ -30,11 +32,12 @@ type App struct {
 	Consumer        *consumer.Consumer
 	ConsumerChannel *amqp.Channel
 
-	Redis        *cache.RedisClient
+	Redis       *cache.RedisClient
 	RateLimiter ratelimit.Limiter
 }
 
 func NewApp(pythonBaseURL string) (*App, error) {
+	// 1. 创建 Executor Registry
 	registry := executor.NewRegistry()
 
 	startExecutor := executor.NewStartExecutor()
@@ -62,8 +65,7 @@ func NewApp(pythonBaseURL string) (*App, error) {
 		return nil, err
 	}
 
-	engine := workflow.NewEngine(registry)
-
+	// 2. 初始化 SQLite
 	if err := os.MkdirAll("data", 0755); err != nil {
 		return nil, err
 	}
@@ -80,17 +82,31 @@ func NewApp(pythonBaseURL string) (*App, error) {
 		return nil, err
 	}
 
+	// 3. 恢复异常中断的 Run
 	recoveredRuns, err := repository.RecoverInterruptedRuns(db)
 	if err != nil {
 		db.Close()
 		return nil, err
 	}
 
-	log.Printf("recovered %d interrupted workflow runs", recoveredRuns)
+	log.Printf(
+		"recovered %d interrupted workflow runs",
+		recoveredRuns,
+	)
 
+	// 4. 创建 Repository
 	runRepo := repository.NewRunRepository(db)
+	eventRepo := repository.NewEventRepository(db)
 	outboxRepo := repository.NewOutboxRepository(db)
 
+	// 5. 创建 Workflow Engine
+	// Engine 现在可以通过 EventWriter 写入节点事件。
+	engine := workflow.NewEngine(
+		registry,
+		eventRepo,
+	)
+
+	// 6. 初始化 Redis
 	redisAddr := os.Getenv("REDIS_ADDR")
 	if redisAddr == "" {
 		redisAddr = "localhost:6379"
@@ -104,7 +120,10 @@ func NewApp(pythonBaseURL string) (*App, error) {
 		0,
 	)
 	if err != nil {
-		log.Printf("WARNING: redis unavailable, running without redis: %v", err)
+		log.Printf(
+			"WARNING: redis unavailable, running without redis: %v",
+			err,
+		)
 		redisClient = nil
 	}
 
@@ -114,7 +133,7 @@ func NewApp(pythonBaseURL string) (*App, error) {
 		}
 	}
 
-	// 创建本地限流器，作为 Redis 故障时的降级方案
+	// 7. 创建本地限流器，作为 Redis 故障时的降级方案
 	localLimiter, err := ratelimit.NewLocalLimiter(10, 20)
 	if err != nil {
 		closeRedis()
@@ -122,7 +141,7 @@ func NewApp(pythonBaseURL string) (*App, error) {
 		return nil, err
 	}
 
-	// Redis 限流器：Redis 不可用时保持 nil
+	// 8. Redis 限流器：Redis 不可用时保持 nil
 	var redisLimiter ratelimit.Limiter
 
 	if redisClient != nil {
@@ -133,12 +152,15 @@ func NewApp(pythonBaseURL string) (*App, error) {
 			20,
 		)
 		if err != nil {
-			log.Printf("WARNING: failed to initialize redis limiter, using local limiter: %v", err)
+			log.Printf(
+				"WARNING: failed to initialize redis limiter, using local limiter: %v",
+				err,
+			)
 			redisLimiter = nil
 		}
 	}
 
-	// 组合 Redis 限流器和本地限流器
+	// 9. 组合 Redis 限流器和本地限流器
 	rateLimiter, err := ratelimit.NewFallbackLimiter(
 		redisLimiter,
 		localLimiter,
@@ -149,6 +171,7 @@ func NewApp(pythonBaseURL string) (*App, error) {
 		return nil, err
 	}
 
+	// 10. 初始化 RabbitMQ
 	amqURL := os.Getenv("AMQP_URL")
 	if amqURL == "" {
 		amqURL = "amqp://guest:guest@localhost:5672/"
@@ -169,41 +192,50 @@ func NewApp(pythonBaseURL string) (*App, error) {
 		return nil, err
 	}
 
+	// 11. 创建 Consumer
 	c := consumer.NewConsumer(
 		consumerChannel,
 		engine,
 		runRepo,
 	)
 
+	// 12. 配置 RabbitMQ 拓扑
 	if err := rabbitMQ.SetupTopology(); err != nil {
+		consumerChannel.Close()
 		rabbitMQ.Close()
 		closeRedis()
 		db.Close()
 		return nil, err
 	}
 
+	// 13. 开启 Publisher Confirm
 	if err := rabbitMQ.EnableConfirm(); err != nil {
+		consumerChannel.Close()
 		rabbitMQ.Close()
 		closeRedis()
 		db.Close()
 		return nil, err
 	}
 
+	// 14. 创建 Publisher
 	p := publisher.NewPublisher(
-		outboxRepo, rabbitMQ,
+		outboxRepo,
+		rabbitMQ,
 	)
 
+	// 15. 返回 App
 	return &App{
 		Engine:          engine,
 		DB:              db,
-		Redis:           redisClient,
-		RateLimiter:     rateLimiter,
-		RunRepo:         runRepo,
-		OutboxRepo:      outboxRepo,
-		RabbitMQ:        rabbitMQ,
-		Publisher:       p,
-		Consumer:        c,
-		ConsumerChannel: consumerChannel,
+		Redis:            redisClient,
+		RateLimiter:      rateLimiter,
+		RunRepo:          runRepo,
+		EventRepo:        eventRepo,
+		OutboxRepo:       outboxRepo,
+		RabbitMQ:         rabbitMQ,
+		Publisher:        p,
+		Consumer:         c,
+		ConsumerChannel:  consumerChannel,
 	}, nil
 }
 

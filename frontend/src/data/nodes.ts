@@ -66,37 +66,37 @@ export const NODE_DEFINITION: NodeDefinition[] = [
             }
         ]
     },
-    {
-        name:'conditionNode',
-        label:'条件分支',
-        icon:'Branching',
-        color:'#F472B6',
-        inputs: [
-        {   
-            name: 'operator',
-            label: '判断方式',
-            type: 'dropdown',
-            optional: false,
-            options: [
-            { name: 'equals', label: '等于' },
-            { name: 'notEquals', label: '不等于' },
-            { name: 'contains', label: '包含' },
-            ],
-            default: 'equals',
-        },
-        {
-            name: 'value',
-            label: '比较值',
-            type: 'string',
-            optional: false,
-            options: [],
-        },
-        ],
-        outputs:[
-            {name: 'true',label: '是'},
-            {name: 'false',label: '否'}
-        ]
-    },
+    // {
+    //     name:'conditionNode',
+    //     label:'条件分支',
+    //     icon:'Branching',
+    //     color:'#F472B6',
+    //     inputs: [
+    //     {   
+    //         name: 'operator',
+    //         label: '判断方式',
+    //         type: 'dropdown',
+    //         optional: false,
+    //         options: [
+    //         { name: 'equals', label: '等于' },
+    //         { name: 'notEquals', label: '不等于' },
+    //         { name: 'contains', label: '包含' },
+    //         ],
+    //         default: 'equals',
+    //     },
+    //     {
+    //         name: 'value',
+    //         label: '比较值',
+    //         type: 'string',
+    //         optional: false,
+    //         options: [],
+    //     },
+    //     ],
+    //     outputs:[
+    //         {name: 'true',label: '是'},
+    //         {name: 'false',label: '否'}
+    //     ]
+    // },
     {
         name:'endNode',
         label: '结束',
